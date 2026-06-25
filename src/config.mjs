@@ -10,3 +10,9 @@ export const DEEPSEEK_SHA3_WASM =
 export const AUTH_DIR = path.join(os.homedir(), ".deepseek-free-api");
 export const AUTH_FILE = path.join(AUTH_DIR, "auth.json");
 export const BROWSER_PROFILE = path.join(AUTH_DIR, "browser-profile");
+
+// SOCKS5 proxy: env SOCKS5_PROXY=host:port or socks5://user:pass@host:port
+// Also settable via --proxy flag before server starts
+export function getSocks5Proxy() {
+  return process.env.SOCKS5_PROXY || "";
+}

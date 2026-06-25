@@ -1,4 +1,5 @@
 import { DEEPSEEK_SHA3_WASM } from "./config.mjs";
+import { getProxyDispatcher } from "./proxy.mjs";
 
 let wasmSolverPromise = null;
 
@@ -42,7 +43,11 @@ export class DeepSeekHash {
   }
 
   static async create(wasmUrl) {
-    const res = await fetch(wasmUrl);
+    const fetchOpts = {};
+    const dispatcher = getProxyDispatcher();
+    if (dispatcher) fetchOpts.dispatcher = dispatcher;
+
+    const res = await fetch(wasmUrl, fetchOpts);
     if (!res.ok) throw new Error(`Failed to load PoW WASM: HTTP ${res.status}`);
     const wasmBuffer = await res.arrayBuffer();
     const { instance } = await WebAssembly.instantiate(wasmBuffer, { wbg: {} });

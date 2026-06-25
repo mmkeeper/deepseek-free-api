@@ -20,10 +20,23 @@ import {
   clearProfileSession,
 } from "./src/auth.mjs";
 import { BASE_URL } from "./src/config.mjs";
+import { getProxyInfo } from "./src/proxy.mjs";
 
 // ─── Config ───────────────────────────────────────────────
-const PORT = parseInt(process.argv[2] || process.env.PORT || "18632", 10);
+const firstArg = process.argv[2];
+const PORT = (firstArg && !firstArg.startsWith("-") && !isNaN(parseInt(firstArg, 10)))
+  ? parseInt(firstArg, 10)
+  : parseInt(process.env.PORT || "18632", 10);
 const HOST = process.env.HOST || "0.0.0.0";
+
+// ─── SOCKS5 proxy from env or --proxy flag ────────────────
+const proxyFlagIdx = process.argv.indexOf("--proxy");
+if (proxyFlagIdx !== -1) {
+  const proxyVal = process.argv[proxyFlagIdx + 1];
+  if (proxyVal && !proxyVal.startsWith("--")) {
+    process.env.SOCKS5_PROXY = proxyVal;
+  }
+}
 
 // ─── Auth state ───────────────────────────────────────────
 let auth = { cookieHeader: "", token: "" };
@@ -213,13 +226,16 @@ if (args.includes("--help") || args.includes("-h")) {
   --connect [порт]       Подключиться к твоему Chrome через CDP (по умолч. порт 9222)
   --import <файл> <токен> Импорт cookies из JSON-файла + userToken вручную
   --manual               Показать инструкцию по ручному экспорту сессии
+  --proxy <url>          SOCKS5 прокси (host:port или socks5://user:pass@host:port)
   --help                 Эта справка
 
 Примеры:
-  node server.mjs                # Запуск сервера
-  node server.mjs --login        # Войти в DeepSeek через новое окно
-  node server.mjs --connect      # Забрать сессию из твоего Chrome
+  node server.mjs                                  # Запуск сервера
+  node server.mjs --login                          # Войти в DeepSeek через новое окно
+  node server.mjs --connect                        # Забрать сессию из твоего Chrome
   node server.mjs --import cookies.json "sk-or-...token"
+  node server.mjs --proxy 127.0.0.1:1080           # Через SOCKS5 прокси
+  node server.mjs --proxy socks5://user:pass@10.0.0.1:1080
   `);
   process.exit(0);
 }
@@ -271,12 +287,17 @@ if (args.includes("--login")) {
   initAuth(true).then(() => process.exit(0)).catch((e) => { console.error(e.message); process.exit(1); });
 } else {
   server.listen(PORT, HOST, async () => {
+    const proxyInfo = getProxyInfo();
+    const proxyLine = proxyInfo
+      ? `SOCKS5:  ${proxyInfo.host}:${proxyInfo.port}${proxyInfo.hasAuth ? " (auth)" : ""}`
+      : "SOCKS5:  off";
     console.log(`
 ╔══════════════════════════════════════════════════╗
 ║     DeepSeek Free → OpenAI Proxy                ║
 ║══════════════════════════════════════════════════║
 ║  Порт:    ${String(PORT).padEnd(39)}║
 ║  Хост:    ${HOST.padEnd(39)}║
+║  ${proxyLine.padEnd(47)}║
 ║══════════════════════════════════════════════════║
 ║  POST http://localhost:${PORT}/v1/chat/completions    ║
 ║  GET  http://localhost:${PORT}/v1/models               ║

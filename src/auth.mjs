@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { BASE_URL, AUTH_FILE, BROWSER_PROFILE } from "./config.mjs";
+import { BASE_URL, AUTH_FILE, BROWSER_PROFILE, getSocks5Proxy } from "./config.mjs";
 
 // ─── Auth persistence ────────────────────────────────────────
 
@@ -259,11 +259,45 @@ export function printManualInstructions() {
 
 // ─── Browser helpers ─────────────────────────────────────────
 
+function parseSocks5ProxyForPlaywright(proxyStr) {
+  const str = proxyStr.replace(/^socks5:\/\//, "").replace(/^socks:\/\//, "");
+  let username = undefined;
+  let password = undefined;
+  let hostPort = str;
+
+  const atIndex = str.lastIndexOf("@");
+  if (atIndex !== -1) {
+    const authStr = str.slice(0, atIndex);
+    hostPort = str.slice(atIndex + 1);
+    const colonIdx = authStr.indexOf(":");
+    if (colonIdx !== -1) {
+      username = decodeURIComponent(authStr.slice(0, colonIdx));
+      password = decodeURIComponent(authStr.slice(colonIdx + 1));
+    }
+  }
+
+  const result = { server: `socks5://${hostPort}` };
+  if (username) result.username = username;
+  if (password) result.password = password;
+  return result;
+}
+
 async function launchPersistentContext(chromium, headless) {
   const tryLaunch = async () => {
-    try { return await chromium.launchPersistentContext(BROWSER_PROFILE, { headless, viewport: null, args: ["--disable-blink-features=AutomationControlled"], channel: "chrome" }); }
+    const launchOpts = {
+      headless,
+      viewport: null,
+      args: ["--disable-blink-features=AutomationControlled"],
+    };
+
+    if (getSocks5Proxy()) {
+      const proxy = parseSocks5ProxyForPlaywright(getSocks5Proxy());
+      launchOpts.proxy = proxy;
+    }
+
+    try { return await chromium.launchPersistentContext(BROWSER_PROFILE, { ...launchOpts, channel: "chrome" }); }
     catch (e) {
-      try { return await chromium.launchPersistentContext(BROWSER_PROFILE, { headless, viewport: null, args: ["--disable-blink-features=AutomationControlled"] }); }
+      try { return await chromium.launchPersistentContext(BROWSER_PROFILE, launchOpts); }
       catch (e2) { throw new Error(`Chrome: ${e.message}. Chromium: ${e2.message}`); }
     }
   };

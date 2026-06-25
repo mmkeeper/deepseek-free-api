@@ -13,6 +13,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "playwright": "^1.60.0"
+    "playwright": "^1.60.0",
+    "undici": "^8.5.0"
   }
 }

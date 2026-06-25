@@ -2,6 +2,7 @@ import { BASE_URL, COMPLETION_PATH } from "./config.mjs";
 import { baseHeaders } from "./headers.mjs";
 import { solvePow } from "./pow.mjs";
 import { streamSse } from "./sse.mjs";
+import { getProxyDispatcher } from "./proxy.mjs";
 
 export class DeepSeekClient {
   constructor({ cookieHeader, token, debug = false }) {
@@ -15,11 +16,15 @@ export class DeepSeekClient {
   }
 
   async _request(path, { method = "GET", body } = {}) {
-    const res = await fetch(`${BASE_URL}${path}`, {
+    const fetchOpts = {
       method,
       headers: this._buildHeaders(),
       body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    };
+    const dispatcher = getProxyDispatcher();
+    if (dispatcher) fetchOpts.dispatcher = dispatcher;
+
+    const res = await fetch(`${BASE_URL}${path}`, fetchOpts);
 
     const text = await res.text();
     let json;
@@ -86,14 +91,18 @@ export class DeepSeekClient {
       search_enabled: searchEnabled,
     };
 
-    const res = await fetch(`${BASE_URL}${COMPLETION_PATH}`, {
+    const fetchOpts = {
       method: "POST",
       headers: {
         ...this._buildHeaders(),
         "X-DS-PoW-Response": pow,
       },
       body: JSON.stringify(body),
-    });
+    };
+    const dispatcher = getProxyDispatcher();
+    if (dispatcher) fetchOpts.dispatcher = dispatcher;
+
+    const res = await fetch(`${BASE_URL}${COMPLETION_PATH}`, fetchOpts);
 
     const contentType = String(res.headers.get("content-type") || "");
     if (!res.ok || !contentType.includes("text/event-stream")) {
