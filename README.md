@@ -72,6 +72,23 @@ node server.mjs
 
 Сервер на `http://localhost:18632`. Готов к работе.
 
+### 4. SOCKS5 прокси (опционально)
+
+Если DeepSeek заблокирован или нужен прокси — передай адрес SOCKS5-сервера:
+
+```bash
+node server.mjs --proxy 127.0.0.1:9150
+node server.mjs --proxy socks5://user:pass@10.0.0.1:1080
+```
+
+Или через переменную окружения:
+
+```bash
+SOCKS5_PROXY=127.0.0.1:9150 node server.mjs
+```
+
+Прокси применяется ко всем запросам: API-вызовы, загрузка WASM, окно логина (Playwright).
+
 ---
 
 ## Куда вставлять
@@ -155,6 +172,7 @@ curl http://localhost:18632/v1/chat/completions \
 ```bash
 node server.mjs              # Запуск сервера
 node server.mjs 8080         # На другом порту
+node server.mjs --proxy 127.0.0.1:9150  # Через SOCKS5 прокси
 node server.mjs --help       # Все команды
 
 # Получение сессии:
