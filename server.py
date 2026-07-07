@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""
+DeepSeek Free -> OpenAI-совместимый прокси.
+
+Использует браузерную сессию DeepSeek (бесплатно) и предоставляет
+OpenAI-совместимый REST API для любых клиентов.
+
+Запуск:          python server.py
+Первый вход:     python server.py --login
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+import time
+from pathlib import Path
+
+from aiohttp import web
+
+from src.auth import (
+    connect_to_running_chrome,
+    import_cookies,
+    login_and_save_auth,
+    print_manual_instructions,
+    read_saved_auth,
+)
+from src.client import AuthError, DeepSeekClient
+from src.config import BASE_URL
+from src.proxy import get_proxy_info
+
+
+# ─── Config ───────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="DeepSeek Free -> OpenAI Proxy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры:
+  python server.py                          Запуск сервера
+  python server.py --login                  Войти через Playwright
+  python server.py --connect                Забрать сессию из Chrome
+  python server.py --proxy 127.0.0.1:1080   Через SOCKS5 прокси
+  python server.py --proxy socks5://user:pass@10.0.0.1:1080
+""",
+    )
+    p.add_argument("port", nargs="?", type=int, default=None, help="Порт (по умолч. 18632)")
+    p.add_argument("--login", action="store_true", help="Логин через Playwright")
+    p.add_argument("--connect", nargs="?", const=9222, type=int, metavar="PORT",
+                   help="Подключиться к Chrome через CDP")
+    p.add_argument("--import", nargs=2, metavar=("COOKIES", "TOKEN"), dest="import_cookies",
+                   help="Импорт cookies.json + userToken")
+    p.add_argument("--manual", action="store_true",
+                   help="Показать инструкцию по ручному экспорту")
+    p.add_argument("--proxy", metavar="URL",
+                   help="SOCKS5 прокси (host:port или socks5://user:pass@host:port)")
+    p.add_argument("--host", default=None, help="Хост (по умолч. 0.0.0.0)")
+    return p.parse_args()
+
+
+# ─── Auth state ───────────────────────────────────────────
+
+auth = {"cookieHeader": "", "token": ""}
+
+
+async def init_auth(force_login: bool = False):
+    global auth
+
+    if force_login:
+        try:
+            from src.auth import _launch_persistent_context
+            from playwright.async_api import async_playwright
+            async with async_playwright() as pw:
+                ctx = await _launch_persistent_context(pw.chromium, True)
+                try:
+                    await ctx.clear_cookies()
+                finally:
+                    await ctx.close()
+        except Exception:
+            pass
+
+        result = await login_and_save_auth()
+        auth["cookieHeader"] = result["cookieHeader"]
+        auth["token"] = result["token"]
+        print("[auth] Новый вход выполнен успешно")
+        return
+
+    saved = read_saved_auth()
+    if saved:
+        auth["cookieHeader"] = saved["cookieHeader"]
+        auth["token"] = saved["token"]
+        print("[auth] Загружена сохранённая авторизация")
+        return
+
+    print("[auth] Нет сохранённой авторизации. Открываю окно логина...")
+    result = await login_and_save_auth()
+    auth["cookieHeader"] = result["cookieHeader"]
+    auth["token"] = result["token"]
+    print("[auth] Авторизация получена")
+
+
+def create_client() -> DeepSeekClient:
+    return DeepSeekClient(
+        cookie_header=auth["cookieHeader"],
+        token=auth["token"],
+        debug=False,
+    )
+
+
+# ─── OpenAI -> DeepSeek conversion ─────────────────────────
+
+def messages_to_prompt(messages: list[dict]) -> str:
+    parts = []
+    for m in messages:
+        role = "Assistant" if m.get("role") == "assistant" else "User"
+        content = ""
+        c = m.get("content")
+        if isinstance(c, str):
+            content = c
+        elif isinstance(c, list):
+            content = "\n".join(
+                item["text"] for item in c if item.get("type") == "text"
+            )
+        parts.append(f"{role}: {content}")
+    return "\n\n".join(parts) + "\n\nAssistant:"
+
+
+def openai_chunk(chunk_id: str, created: int, model: str, content: str, finish_reason: str | None = None) -> str:
+    delta = {"content": content, "role": "assistant"} if content else {}
+    return (
+        f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': delta, 'logprobs': None, 'finish_reason': finish_reason}]})}\n\n"
+    )
+
+
+def openai_done() -> str:
+    return "data: [DONE]\n\n"
+
+
+def openai_full(chunk_id: str, created: int, model: str, content: str) -> str:
+    return json.dumps({
+        "id": chunk_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "logprobs": None, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
+
+
+# ─── Completion handler ────────────────────────────────────
+
+async def handle_completion(body: dict) -> dict:
+    messages = body.get("messages", [])
+    stream = body.get("stream", False)
+    model = body.get("model", "deepseek-chat")
+    prompt = messages_to_prompt(messages)
+
+    client = create_client()
+    session_id = await client.create_session()
+
+    model_lower = (model or "").lower()
+    model_type = None
+    if "reasoner" in model_lower or "r1" in model_lower:
+        model_type = "deepseek-reasoner"
+
+    if stream:
+        async def run_stream(on_chunk, on_done, on_error):
+            try:
+                chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
+                created = int(time.time())
+                on_chunk(openai_chunk(chunk_id, created, model, "", None))
+
+                await client.complete(
+                    session_id=session_id,
+                    prompt=prompt,
+                    model_type=model_type,
+                    thinking_enabled=False,
+                    search_enabled=False,
+                    on_text=lambda text: on_chunk(openai_chunk(chunk_id, created, model, text, None)),
+                )
+
+                on_chunk(openai_chunk(chunk_id, created, model, "", "stop"))
+                on_chunk(openai_done())
+                on_done()
+            except Exception as e:
+                on_error(e)
+
+        return {"type": "stream", "run": run_stream}
+
+    full_text = ""
+
+    def on_text(text: str):
+        nonlocal full_text
+        full_text += text
+
+    await client.complete(
+        session_id=session_id,
+        prompt=prompt,
+        model_type=model_type,
+        thinking_enabled=False,
+        search_enabled=False,
+        on_text=on_text,
+    )
+
+    chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
+    created = int(time.time())
+    return {"type": "json", "body": openai_full(chunk_id, created, model, full_text)}
+
+
+# ─── HTTP routes ──────────────────────────────────────────
+
+async def handle_options(request: web.Request) -> web.Response:
+    return web.Response(status=204)
+
+
+async def handle_models(request: web.Request) -> web.Response:
+    now = int(time.time() * 1000)
+    models = [
+        {"id": "deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": "deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": "deepseek-r1", "object": "model", "created": now, "owned_by": "deepseek"},
+    ]
+    return web.json_response({"object": "list", "data": models})
+
+
+async def handle_health(request: web.Request) -> web.Response:
+    import os
+    return web.json_response({
+        "status": "ok",
+        "auth_loaded": bool(auth["token"]),
+        "port": request.app["port"],
+        "deepseek_url": BASE_URL,
+    })
+
+
+async def handle_chat(request: web.Request) -> web.StreamResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    try:
+        result = await handle_completion(body)
+    except AuthError as e:
+        return web.json_response({"error": "auth_required", "message": str(e)}, status=401)
+    except Exception as e:
+        return web.json_response({"error": "internal_error", "message": str(e)}, status=500)
+
+    if result["type"] == "json":
+        return web.Response(text=result["body"], content_type="application/json")
+
+    # Streaming response
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+    await response.prepare(request)
+
+    closed = False
+
+    async def safe_write(data: bytes):
+        nonlocal closed
+        if not closed:
+            try:
+                await response.write(data)
+            except Exception:
+                closed = True
+
+    def on_chunk(chunk: str):
+        asyncio.ensure_future(safe_write(chunk.encode("utf-8")))
+
+    def on_done():
+        nonlocal closed
+        if not closed:
+            asyncio.ensure_future(safe_write(b"data: [DONE]\n\n"))
+            asyncio.ensure_future(response.write_eof())
+            closed = True
+
+    def on_error(error: Exception):
+        nonlocal closed
+        if not closed:
+            print(f"[stream] {error}", file=sys.stderr)
+            err_data = json.dumps({"error": str(error)})
+            asyncio.ensure_future(safe_write(f"data: {err_data}\n\n".encode("utf-8")))
+            asyncio.ensure_future(response.write_eof())
+            closed = True
+
+    asyncio.create_task(result["run"](on_chunk, on_done, on_error))
+
+    return response
+
+
+async def handle_not_found(request: web.Request) -> web.Response:
+    return web.json_response(
+        {"error": "not_found", "message": f"Path {request.path} not found"},
+        status=404,
+    )
+
+
+# ─── CORS middleware ───────────────────────────────────────
+
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        resp = web.Response(status=204)
+    else:
+        try:
+            resp = await handler(request)
+        except web.HTTPException as ex:
+            resp = ex
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return resp
+
+
+# ─── Main ─────────────────────────────────────────────────
+
+async def run_server(port: int, host: str):
+    app = web.Application(middlewares=[cors_middleware])
+    app["port"] = port
+
+    app.router.add_route("*", "/v1/models", handle_models)
+    app.router.add_route("*", "/health", handle_health)
+    app.router.add_route("*", "/", handle_health)
+    app.router.add_route("*", "/v1/chat/completions", handle_chat)
+    app.router.add_route("*", "/{path:.*}", handle_not_found)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+
+    proxy_info = get_proxy_info()
+    proxy_line = (
+        f"SOCKS5:  {proxy_info['host']}:{proxy_info['port']}"
+        + (" (auth)" if proxy_info["hasAuth"] else "")
+        if proxy_info
+        else "SOCKS5:  off"
+    )
+
+    print(f"""
+╔══════════════════════════════════════════════════╗
+║     DeepSeek Free -> OpenAI Proxy                ║
+║══════════════════════════════════════════════════║
+║  Порт:    {str(port):<39}║
+║  Хост:    {host:<39}║
+║  {proxy_line:<47}║
+║══════════════════════════════════════════════════║
+║  POST http://localhost:{port}/v1/chat/completions    ║
+║  GET  http://localhost:{port}/v1/models               ║
+║  GET  http://localhost:{port}/health                   ║
+╚══════════════════════════════════════════════════╝
+    """)
+
+    try:
+        await init_auth()
+        print("\nСервер готов к работе!\n")
+    except Exception as e:
+        print(f"\nАвторизация не загружена: {e}")
+        print("   Выполни: python server.py --login\n")
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await runner.cleanup()
+
+
+def main():
+    args = parse_args()
+
+    if args.proxy:
+        import os
+        os.environ["SOCKS5_PROXY"] = args.proxy
+
+    if args.manual:
+        print_manual_instructions()
+        return
+
+    if args.import_cookies:
+        cookies_file, token_str = args.import_cookies
+        try:
+            import_cookies(cookies_file, token_str)
+            print("Импорт готов. Запускай: python server.py")
+        except Exception as e:
+            print(f"Ошибка: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.connect is not None:
+        try:
+            asyncio.run(connect_to_running_chrome(args.connect))
+            print("Подключение готово. Запускай: python server.py")
+        except Exception as e:
+            print(f"Ошибка: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.login:
+        asyncio.run(init_auth(force_login=True))
+        return
+
+    port = args.port or int(__import__("os").environ.get("PORT", "18632"))
+    host = args.host or __import__("os").environ.get("HOST", "0.0.0.0")
+    asyncio.run(run_server(port, host))
+
+
+if __name__ == "__main__":
+    main()
