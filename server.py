@@ -47,7 +47,10 @@ def parse_args() -> argparse.Namespace:
   python server.py --proxy socks5://user:pass@10.0.0.1:1080
 """,
     )
-    p.add_argument("port", nargs="?", type=int, default=None, help="Порт (по умолч. 18632)")
+    p.add_argument("--port", type=int, default=None, help="Listen port (default: 18632)")
+    p.add_argument("--host", default=None, help="Listen host (default: 0.0.0.0)")
+    p.add_argument("--proxy", default=None, help="SOCKS5 proxy (socks5://host:port)")
+    p.add_argument("--api-key", default=None, help="API key for client auth")
     p.add_argument("--login", action="store_true", help="Логин через Playwright")
     p.add_argument("--connect", nargs="?", const=9222, type=int, metavar="PORT",
                    help="Подключиться к Chrome через CDP")
@@ -55,9 +58,6 @@ def parse_args() -> argparse.Namespace:
                    help="Импорт cookies.json + userToken")
     p.add_argument("--manual", action="store_true",
                    help="Показать инструкцию по ручному экспорту")
-    p.add_argument("--proxy", metavar="URL",
-                   help="SOCKS5 прокси (host:port или socks5://user:pass@host:port)")
-    p.add_argument("--host", default=None, help="Хост (по умолч. 0.0.0.0)")
     return p.parse_args()
 
 
