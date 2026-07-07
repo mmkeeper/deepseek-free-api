@@ -92,10 +92,17 @@ async def init_auth(force_login: bool = False):
     if saved:
         auth["cookieHeader"] = saved["cookieHeader"]
         auth["token"] = saved["token"]
-        print("[auth] Загружена сохранённая авторизация")
-        return
+        print("[auth] Загружена сохранённая авторизация, проверяю...")
+        try:
+            client = create_client()
+            await client.create_session()
+            print("[auth] Токен валиден")
+            return
+        except AuthError:
+            print("[auth] Токен истёк, открываю окно логина...")
+        except Exception as e:
+            print(f"[auth] Ошибка проверки: {e}, открываю окно логина...")
 
-    print("[auth] Нет сохранённой авторизации. Открываю окно логина...")
     result = await login_and_save_auth()
     auth["cookieHeader"] = result["cookieHeader"]
     auth["token"] = result["token"]
