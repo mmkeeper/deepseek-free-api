@@ -188,7 +188,11 @@ async def login_and_save_auth() -> dict:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False)
+        browser = await pw.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+            channel="chrome",
+        )
         context = await browser.new_context()
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(BASE_URL, wait_until="domcontentloaded")
