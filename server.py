@@ -177,8 +177,13 @@ def messages_to_prompt(messages: list[dict]) -> str:
     return "\n\n".join(parts) + "\n\nAssistant:"
 
 
-def openai_chunk(chunk_id: str, created: int, model: str, content: str, finish_reason: str | None = None) -> str:
-    delta = {"content": content, "role": "assistant"} if content else {}
+def openai_chunk(chunk_id: str, created: int, model: str, content: str, finish_reason: str | None = None, reasoning_content: str | None = None) -> str:
+    delta: dict = {}
+    if content:
+        delta["content"] = content
+        delta["role"] = "assistant"
+    if reasoning_content:
+        delta["reasoning_content"] = reasoning_content
     return (
         f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': delta, 'logprobs': None, 'finish_reason': finish_reason}]})}\n\n"
     )
@@ -264,7 +269,7 @@ async def handle_completion(body: dict) -> dict:
                     if not thinking_opened:
                         on_chunk(openai_chunk(chunk_id, created, model, "<think>", None))
                         thinking_opened = True
-                    on_chunk(openai_chunk(chunk_id, created, model, text, None))
+                    on_chunk(openai_chunk(chunk_id, created, model, text, None, reasoning_content=text))
 
                 def on_text_chunk(text: str):
                     nonlocal thinking_opened
@@ -335,6 +340,7 @@ async def handle_completion(body: dict) -> dict:
     response_body = json.loads(openai_full(chunk_id, created, model, full_text))
     if full_thinking:
         response_body["thinking"] = full_thinking
+        response_body["choices"][0]["message"]["reasoning_content"] = full_thinking
     return {"type": "json", "body": json.dumps(response_body)}
 
 
