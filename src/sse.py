@@ -22,6 +22,11 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
     def visit(node: Any, path: str):
         nonlocal message_id, text
 
+        if isinstance(node, list):
+            for i, item in enumerate(node):
+                visit(item, f"{path}.{i}")
+            return
+
         if not isinstance(node, dict):
             return
 
@@ -71,11 +76,6 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             delta = choices[0].get("delta")
             if isinstance(delta, dict) and isinstance(delta.get("content"), str):
                 text += delta["content"]
-
-        if isinstance(node, list):
-            for i, item in enumerate(node):
-                visit(item, f"{path}.{i}")
-            return
 
         for key, item in node.items():
             if key in ("content", "choices"):
