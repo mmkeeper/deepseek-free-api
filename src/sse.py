@@ -151,11 +151,6 @@ async def stream_sse(
     fragments: dict[str, str] = {}
     buffer = ""
 
-    _dbg = None
-    if debug:
-        import os, tempfile
-        _dbg = open(os.path.join(tempfile.gettempdir(), "ds_sse_debug.log"), "w", encoding="utf-8")
-
     async for line in response.aiter_text():
         buffer += line
         while True:
@@ -183,10 +178,6 @@ async def stream_sse(
             except (json.JSONDecodeError, ValueError):
                 continue
 
-            if _dbg:
-                _dbg.write(json.dumps({"event": event["event"], "data": parsed}, ensure_ascii=False) + "\n")
-                _dbg.flush()
-
             text, thinking, msg_id = extract_delta_text(parsed, fragments, event["event"])
             if msg_id is not None:
                 last_message_id = msg_id
@@ -198,8 +189,5 @@ async def stream_sse(
                 full_thinking += thinking
                 if on_thinking:
                     on_thinking(thinking)
-
-    if _dbg:
-        _dbg.close()
 
     return {"lastAssistantMessageId": last_message_id, "text": full_text, "thinking": full_thinking}
