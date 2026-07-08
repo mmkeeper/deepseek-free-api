@@ -257,6 +257,22 @@ async def handle_completion(body: dict) -> dict:
                 created = int(time.time())
                 on_chunk(openai_chunk(chunk_id, created, model, "", None))
 
+                thinking_opened = False
+
+                def on_thinking_chunk(text: str):
+                    nonlocal thinking_opened
+                    if not thinking_opened:
+                        on_chunk(openai_chunk(chunk_id, created, model, "<think>", None))
+                        thinking_opened = True
+                    on_chunk(openai_chunk(chunk_id, created, model, text, None))
+
+                def on_text_chunk(text: str):
+                    nonlocal thinking_opened
+                    if thinking_opened:
+                        on_chunk(openai_chunk(chunk_id, created, model, "</think>", None))
+                        thinking_opened = False
+                    on_chunk(openai_chunk(chunk_id, created, model, text, None))
+
                 result = await client.complete(
                     session_id=session_id,
                     prompt=prompt,
@@ -264,8 +280,12 @@ async def handle_completion(body: dict) -> dict:
                     parent_message_id=parent_message_id,
                     thinking_enabled=thinking_enabled,
                     search_enabled=search_enabled,
-                    on_text=lambda text: on_chunk(openai_chunk(chunk_id, created, model, text, None)),
+                    on_text=on_text_chunk,
+                    on_thinking=on_thinking_chunk,
                 )
+
+                if thinking_opened:
+                    on_chunk(openai_chunk(chunk_id, created, model, "</think>", None))
 
                 # Store session for reuse — key is hash of user messages including this turn
                 if result and result.get("lastAssistantMessageId"):
