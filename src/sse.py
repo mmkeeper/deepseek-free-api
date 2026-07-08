@@ -20,6 +20,11 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
     text = ""
     thinking = ""
 
+    # Track fragment types so APPEND events know whether content belongs to
+    # THINK or RESPONSE.  Keyed by the content path that APPEND events use
+    # (e.g. "$.v.0/content"), which we derive from the snapshot's visit path.
+    fragment_types: dict[str, str] = cache.setdefault("_fragment_types", {})
+
     def visit(node: Any, path: str):
         nonlocal message_id, text, thinking
 
@@ -52,8 +57,14 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             and node["p"].endswith("/content")
             and isinstance(node.get("v"), str)
         ):
-            node_type = node.get("type", "")
-            if "THINK" in node.get("p", "").upper() or node_type == "THINK":
+            append_path = node["p"]
+            frag_type = fragment_types.get(append_path, "")
+            if not frag_type:
+                for known_path, ftype in fragment_types.items():
+                    if append_path.startswith(known_path + "/"):
+                        frag_type = ftype
+                        break
+            if frag_type == "THINK" or node.get("type") == "THINK":
                 thinking += node["v"]
             else:
                 text += node["v"]
@@ -74,6 +85,9 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             delta = current[len(previous) :] if current.startswith(previous) else current
             cache[key] = current
             text += delta
+            # Record fragment type so future APPEND events on child paths
+            # (e.g. "$.v.0/content") can look up via prefix match.
+            fragment_types[path] = node["type"]
 
         if isinstance(node.get("content"), str) and node.get("type") == "THINK":
             key = f"{message_id or 'unknown'}:{path}:THINK"
@@ -82,6 +96,8 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             delta = current[len(previous) :] if current.startswith(previous) else current
             cache[key] = current
             thinking += delta
+            # Record fragment type for prefix-based APPEND lookup
+            fragment_types[path] = "THINK"
 
         choices = node.get("choices")
         if isinstance(choices, list) and choices:
