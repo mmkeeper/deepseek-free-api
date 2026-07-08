@@ -207,7 +207,7 @@ async def handle_completion(body: dict) -> dict:
     model = body.get("model", "deepseek-chat")
 
     model_lower = (model or "").lower()
-    model_type = None
+    model_type = "default"
     if "reasoner" in model_lower or "r1" in model_lower:
         model_type = "expert"
 
