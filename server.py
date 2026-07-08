@@ -122,15 +122,33 @@ def create_client() -> DeepSeekClient:
 
 _session_store: dict[str, tuple[str, int | None]] = {}
 
+_log_file = None
+
+
+def _log(msg: str):
+    global _log_file
+    if _log_file is None:
+        import tempfile, os
+        _log_file = open(os.path.join(tempfile.gettempdir(), "ds_session.log"), "a", encoding="utf-8")
+    _log_file.write(msg + "\n")
+    _log_file.flush()
+
 
 def _hash_messages(msgs: list[dict]) -> str:
     raw = json.dumps(msgs, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _user_messages(msgs: list[dict]) -> list[dict]:
+    """Extract only user + system messages — stable across turns."""
+    return [{"role": m["role"], "content": m.get("content", "")}
+            for m in msgs if m.get("role") in ("user", "system")]
+
+
 def _prefix_key(messages: list[dict]) -> str:
-    """Hash of messages[:-1] — the conversation prefix before the latest user turn."""
-    return _hash_messages(messages[:-1]) if len(messages) >= 1 else _hash_messages([])
+    """Hash of user/system messages in prefix (all except last user turn)."""
+    prefix = messages[:-1] if len(messages) >= 1 else []
+    return _hash_messages(_user_messages(prefix))
 
 
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
@@ -207,14 +225,16 @@ async def handle_completion(body: dict) -> dict:
 
     if last_msg.get("role") == "user":
         pkey = _prefix_key(messages)
+        _log(f"lookup key={pkey} store_keys={list(_session_store.keys())}")
         existing = _session_store.get(pkey)
         if existing:
             session_id, parent_message_id = existing
             prompt = f"User: {last_content}\n\nAssistant:"
-            print(f"[session] Reuse session {session_id} (parent={parent_message_id})")
+            _log(f"REUSE session {session_id} (parent={parent_message_id})")
         else:
             session_id = await client.create_session()
             prompt = messages_to_prompt(messages)
+            _log(f"NEW session {session_id}")
     else:
         session_id = await client.create_session()
         prompt = messages_to_prompt(messages)
@@ -237,12 +257,11 @@ async def handle_completion(body: dict) -> dict:
                     on_text=lambda text: on_chunk(openai_chunk(chunk_id, created, model, text, None)),
                 )
 
-                # Store session for reuse — key is hash of messages + this response
+                # Store session for reuse — key is hash of user messages including this turn
                 if result and result.get("lastAssistantMessageId"):
-                    full = messages + [{"role": "assistant", "content": result.get("text", "")}]
-                    nkey = _hash_messages(full)
+                    nkey = _hash_messages(_user_messages(messages))
                     _session_store[nkey] = (session_id, result["lastAssistantMessageId"])
-                    print(f"[session] Stored session {session_id} under {nkey}")
+                    _log(f"STORE key={nkey} session={session_id}")
 
                 on_chunk(openai_chunk(chunk_id, created, model, "", "stop"))
                 on_chunk(openai_done())
@@ -269,12 +288,11 @@ async def handle_completion(body: dict) -> dict:
         on_text=on_text,
     )
 
-    # Store session for reuse — key is hash of messages + this response
+    # Store session for reuse — key is hash of user messages including this turn
     if result and result.get("lastAssistantMessageId"):
-        full = messages + [{"role": "assistant", "content": full_text}]
-        nkey = _hash_messages(full)
+        nkey = _hash_messages(_user_messages(messages))
         _session_store[nkey] = (session_id, result["lastAssistantMessageId"])
-        print(f"[session] Stored session {session_id} under {nkey}")
+        _log(f"STORE key={nkey} session={session_id}")
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
@@ -312,6 +330,8 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid_json"}, status=400)
+
+    messages = body.get("messages", [])
 
     try:
         result = await handle_completion(body)
