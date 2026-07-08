@@ -21,9 +21,51 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
     thinking = ""
 
     # Track fragment types so APPEND events know whether content belongs to
-    # THINK or RESPONSE.  Keyed by the content path that APPEND events use
-    # (e.g. "$.v.0/content"), which we derive from the snapshot's visit path.
+    # THINK or RESPONSE.  Keyed by the visit path (e.g. "$.v.0").
     fragment_types: dict[str, str] = cache.setdefault("_fragment_types", {})
+    # Buffer APPEND text that arrives before its SNAPSHOT establishes the type.
+    # Keyed by the visit path derived from the APPEND path (e.g. "$.v.0").
+    pending: dict[str, list[str]] = cache.setdefault("_pending_appends", {})
+
+    # SSE event name can indicate fragment type (e.g. "thinking" vs "message")
+    event_type_from_name = ""
+    if event_name:
+        ename = event_name.lower()
+        if "think" in ename:
+            event_type_from_name = "THINK"
+
+    def _append_path_to_visit(append_path: str) -> str:
+        """Convert APPEND path like '$.v.0/content' to visit path '$.v.0'."""
+        if append_path.endswith("/content"):
+            return append_path[:-len("/content")]
+        return append_path
+
+    def _resolve_type(append_path: str) -> str:
+        visit_path = _append_path_to_visit(append_path)
+        ftype = fragment_types.get(visit_path, "")
+        if not ftype:
+            for known_path, ft in fragment_types.items():
+                if visit_path.startswith(known_path + "/") or visit_path == known_path:
+                    ftype = ft
+                    break
+        # Fallback: use SSE event name to determine type
+        if not ftype and event_type_from_name:
+            ftype = event_type_from_name
+        return ftype
+
+    def _replay_pending(visit_path: str, ftype: str) -> int:
+        """Replay buffered APPENDs for a visit path once its type is known.
+        Returns the length of content that was replayed."""
+        nonlocal text, thinking
+        pieces = pending.pop(visit_path, [])
+        if not pieces:
+            return 0
+        combined = "".join(pieces)
+        if ftype == "THINK":
+            thinking += combined
+        else:
+            text += combined
+        return len(combined)
 
     def visit(node: Any, path: str):
         nonlocal message_id, text, thinking
@@ -58,16 +100,15 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             and isinstance(node.get("v"), str)
         ):
             append_path = node["p"]
-            frag_type = fragment_types.get(append_path, "")
-            if not frag_type:
-                for known_path, ftype in fragment_types.items():
-                    if append_path.startswith(known_path + "/"):
-                        frag_type = ftype
-                        break
-            if frag_type == "THINK" or node.get("type") == "THINK":
+            frag_type = _resolve_type(append_path)
+            if frag_type == "THINK":
                 thinking += node["v"]
-            else:
+            elif frag_type:
                 text += node["v"]
+            else:
+                # Type unknown — buffer until SNAPSHOT arrives
+                visit_path = _append_path_to_visit(append_path)
+                pending.setdefault(visit_path, []).append(node["v"])
             return
 
         if node.get("o") == "BATCH" and isinstance(node.get("v"), list):
@@ -82,22 +123,27 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             key = f"{message_id or 'unknown'}:{path}:{node['type']}"
             previous = cache.get(key, "")
             current = node["content"]
-            delta = current[len(previous) :] if current.startswith(previous) else current
+            # Record type and replay any buffered APPENDs for this fragment
+            fragment_types[path] = node["type"]
+            replayed_len = _replay_pending(path, node["type"])
+            # Adjust delta to skip content already contributed by replayed buffer
+            skip = max(len(previous), replayed_len)
+            delta = current[skip:] if current.startswith(current[:skip]) else current[len(previous):]
             cache[key] = current
             text += delta
-            # Record fragment type so future APPEND events on child paths
-            # (e.g. "$.v.0/content") can look up via prefix match.
-            fragment_types[path] = node["type"]
 
         if isinstance(node.get("content"), str) and node.get("type") == "THINK":
             key = f"{message_id or 'unknown'}:{path}:THINK"
             previous = cache.get(key, "")
             current = node["content"]
-            delta = current[len(previous) :] if current.startswith(previous) else current
+            # Record type and replay any buffered APPENDs for this fragment
+            fragment_types[path] = "THINK"
+            replayed_len = _replay_pending(path, "THINK")
+            # Adjust delta to skip content already contributed by replayed buffer
+            skip = max(len(previous), replayed_len)
+            delta = current[skip:] if current.startswith(current[:skip]) else current[len(previous):]
             cache[key] = current
             thinking += delta
-            # Record fragment type for prefix-based APPEND lookup
-            fragment_types[path] = "THINK"
 
         choices = node.get("choices")
         if isinstance(choices, list) and choices:
