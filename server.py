@@ -229,15 +229,14 @@ async def handle_completion(body: dict) -> dict:
         existing = _session_store.get(pkey)
         if existing:
             session_id, parent_message_id = existing
-            prompt = last_content
             _log(f"REUSE session {session_id} (parent={parent_message_id})")
         else:
             session_id = await client.create_session()
-            prompt = messages_to_prompt(messages)
             _log(f"NEW session {session_id}")
+        prompt = last_content
     else:
         session_id = await client.create_session()
-        prompt = messages_to_prompt(messages)
+        prompt = last_content
 
     # ── Streaming ────────────────────────────────────────────
     if stream:
