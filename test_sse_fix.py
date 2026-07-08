@@ -26,19 +26,42 @@ def test_append_think_after_snapshot():
     assert t3 == ""
 
 
-def test_append_response_after_snapshot():
-    """RESPONSE snapshot then APPEND — all goes to text."""
+def test_append_before_snapshot_buffered():
+    """APPEND before SNAPSHOT — buffered, then replayed on SNAPSHOT."""
     cache = {}
 
-    snap = {"o": "SNAPSHOT", "v": [{"type": "RESPONSE", "content": "Hello", "id": 2, "role": "ASSISTANT"}]}
-    t1, th1, mid = extract_delta_text(snap, cache)
-    assert t1 == "Hello"
-    assert th1 == ""
-    assert mid == 2
+    # APPEND arrives first — type unknown, should be buffered
+    a1 = {"o": "APPEND", "p": "$.v.0/content", "v": "П"}
+    t1, th1, _ = extract_delta_text(a1, cache)
+    assert t1 == "", f"should be buffered, got text='{t1}'"
+    assert th1 == "", f"should be buffered, got think='{th1}'"
 
-    append = {"o": "APPEND", "p": "$.v.0/content", "v": " world"}
-    t2, th2, _ = extract_delta_text(append, cache)
-    assert t2 == " world", f"append text: got '{t2}'"
+    # More APPENDs before snapshot
+    a2 = {"o": "APPEND", "p": "$.v.0/content", "v": "ятные значения."}
+    t2, th2, _ = extract_delta_text(a2, cache)
+    assert t2 == "" and th2 == ""
+
+    # SNAPSHOT arrives — replays buffered APPENDs into thinking
+    snap = {"o": "SNAPSHOT", "v": [{"type": "THINK", "content": "Пятные значения.", "id": 1, "role": "ASSISTANT"}]}
+    t3, th3, _ = extract_delta_text(snap, cache)
+    # Buffer replayed "Пятные значения." into thinking, snapshot delta is empty
+    assert th3 == "Пятные значения.", f"buffer replayed into thinking: got '{th3}'"
+    assert t3 == ""
+
+
+def test_append_response_before_snapshot_buffered():
+    """RESPONSE APPEND before SNAPSHOT — buffered, then replayed as text."""
+    cache = {}
+
+    a1 = {"o": "APPEND", "p": "$.v.0/content", "v": "Hello"}
+    t1, th1, _ = extract_delta_text(a1, cache)
+    assert t1 == "" and th1 == ""
+
+    snap = {"o": "SNAPSHOT", "v": [{"type": "RESPONSE", "content": "Hello world", "id": 2, "role": "ASSISTANT"}]}
+    t2, th2, _ = extract_delta_text(snap, cache)
+    # Buffered "Hello" replayed as text, snapshot delta is " world"
+    # Total returned text = "Hello" + " world" = "Hello world"
+    assert t2 == "Hello world", f"response accumulated text: got '{t2}'"
     assert th2 == ""
 
 
@@ -46,7 +69,6 @@ def test_interleaved_fragments():
     """THINK and RESPONSE at different indices — APPENDs go to correct buckets."""
     cache = {}
 
-    # Single SNAPSHOT with both THINK (index 0) and RESPONSE (index 1)
     snap = {"o": "SNAPSHOT", "v": [
         {"type": "THINK", "content": "thinking...", "id": 1, "role": "ASSISTANT"},
         {"type": "RESPONSE", "content": "answer", "id": 2, "role": "ASSISTANT"},
@@ -55,13 +77,11 @@ def test_interleaved_fragments():
     assert th1 == "thinking...", f"think snapshot: got '{th1}'"
     assert t1 == "answer", f"response snapshot: got '{t1}'"
 
-    # APPEND to THINK fragment (index 0)
     a1 = {"o": "APPEND", "p": "$.v.0/content", "v": " more"}
     t2, th2, _ = extract_delta_text(a1, cache)
     assert th2 == " more", f"think append: got '{th2}'"
     assert t2 == ""
 
-    # APPEND to RESPONSE fragment (index 1)
     a2 = {"o": "APPEND", "p": "$.v.1/content", "v": "!"}
     t3, th3, _ = extract_delta_text(a2, cache)
     assert t3 == "!", f"response append: got '{t3}'"
@@ -102,16 +122,6 @@ def test_delta_tracking():
     assert th2 == "cde", f"delta: got '{th2}'"
 
 
-def test_append_before_snapshot():
-    """APPEND before any snapshot — type unknown, goes to text (known limitation)."""
-    cache = {}
-    ev = {"o": "APPEND", "p": "$.v.0/content", "v": "П"}
-    text, think, _ = extract_delta_text(ev, cache)
-    # Without a prior snapshot, we can't know this is THINK content
-    assert text == "П", f"expected text='П', got '{text}'"
-    assert think == "", f"expected empty think, got '{think}'"
-
-
 def test_response_delta_tracking():
     """RESPONSE snapshot content grows — only delta is returned."""
     cache = {}
@@ -125,16 +135,38 @@ def test_response_delta_tracking():
     assert t2 == "lo", f"response delta: got '{t2}'"
 
 
+def test_append_think_full_sequence():
+    """Full sequence: multiple APPENDs before SNAPSHOT, then more after."""
+    cache = {}
+
+    # APPENDs before snapshot
+    for ch in "Пятные":
+        extract_delta_text({"o": "APPEND", "p": "$.v.0/content", "v": ch}, cache)
+
+    # SNAPSHOT with full content
+    snap = {"o": "SNAPSHOT", "v": [{"type": "THINK", "content": "Пятные значения.Погода", "id": 1, "role": "ASSISTANT"}]}
+    _, th1, _ = extract_delta_text(snap, cache)
+    # Buffered "Пятные" replayed, snapshot delta is " значения.Погода"
+    # Total returned thinking = "Пятные" + " значения.Погода" = "Пятные значения.Погода"
+    assert th1 == "Пятные значения.Погода", f"full sequence: got '{th1}'"
+
+    # More APPENDs after snapshot
+    a = {"o": "APPEND", "p": "$.v.0/content", "v": " завтра"}
+    _, th2, _ = extract_delta_text(a, cache)
+    assert th2 == " завтра", f"post-snapshot append: got '{th2}'"
+
+
 if __name__ == "__main__":
     tests = [
         test_append_think_after_snapshot,
-        test_append_response_after_snapshot,
+        test_append_before_snapshot_buffered,
+        test_append_response_before_snapshot_buffered,
         test_interleaved_fragments,
         test_batch_append_think,
         test_simple_v_string,
         test_delta_tracking,
-        test_append_before_snapshot,
         test_response_delta_tracking,
+        test_append_think_full_sequence,
     ]
     for t in tests:
         try:
