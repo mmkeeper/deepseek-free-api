@@ -265,3 +265,39 @@ python server.py
 ## llama-swap integration
 
 Этот сервер работает с [llama-swap](https://github.com/mmkeeper/llama-swap) как peer. Пример конфигурации см. в `config.yaml` в репо llama-swap.
+
+## Thinking (рассуждения)
+
+Сервер поддерживает thinking — внутренние рассуждения модели перед ответом. Thinking включается параметром `thinking_enabled: true` (по умолчанию включен).
+
+### Формат thinking в ответе
+
+**Стриминг (`stream: true`):**
+- Thinking чанки: поле `reasoning_content` в `delta` объекте
+- Также отправляются `<think>` / `</think>` теги в `content` для обратной совместимости
+
+```json
+{"choices": [{"delta": {"reasoning_content": "Анализирую вопрос...", "role": "assistant"}}]}
+{"choices": [{"delta": {"content": "<think>", "role": "assistant"}}]}
+{"choices": [{"delta": {"reasoning_content": "Пользователь спрашивает...", "role": "assistant"}}]}
+{"choices": [{"delta": {"content": "</think>", "role": "assistant"}}]}
+{"choices": [{"delta": {"content": "Ответ пользователя", "role": "assistant"}}]}
+```
+
+**Не-стриминг (`stream: false`):**
+- Thinking в отдельном поле `thinking` в ответе
+- Также доступен в `choices[0].message.reasoning_content`
+
+```json
+{
+  "choices": [{"message": {"content": "Ответ", "reasoning_content": "Рассуждения..."}}],
+  "thinking": "Рассуждения..."
+}
+```
+
+### Совместимость
+
+Протестировано с:
+- **Hermes** (агент) — thinking отображается через `reasoning_content` и `<think>` теги
+- **OpenCode** — thinking в content
+- **curl** — оба формата доступны
