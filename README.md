@@ -190,11 +190,13 @@ curl http://localhost:18632/v1/chat/completions \
 
 ## Модели
 
-| ID | Описание |
-|---|---|
-| `deepseek-chat` | DeepSeek V3 / V4 (обычный чат) |
-| `deepseek-reasoner` | DeepSeek R1 (с рассуждением) |
-| `deepseek-r1` | Алиас deepseek-reasoner |
+| ID | Описание | Работает с прокси | Работает без прокси |
+|---|---|---|---|
+| `deepseek-chat` | DeepSeek V3 / V4 (обычный чат) | ✅ | ✅ |
+| `deepseek-reasoner` | DeepSeek R1 (с рассуждением) | ✅ | ✅ |
+| `deepseek-r1` | Алиас deepseek-reasoner | ✅ | ✅ |
+
+> Для работы через SOCKS5 прокси нужно установить: `pip install "httpx[socks]"`
 
 ---
 
