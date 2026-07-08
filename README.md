@@ -4,6 +4,16 @@
 Без API-ключей, без регистрации, без платежей.  
 Нужен только аккаунт DeepSeek (регистрация бесплатная).
 
+## Related projects
+
+All three projects share the same CLI interface (`--port`, `--host`, `--proxy`, `--api-key`) and work together through [llama-swap](https://github.com/mmkeeper/llama-swap):
+
+| Project | Port | What |
+|---------|------|------|
+| [opencode-free-proxy](https://github.com/mmkeeper/opencode-free-proxy) | 6446 | OpenCode free models |
+| [deepseek-free-api](https://github.com/mmkeeper/deepseek-free-api) | 18632 | DeepSeek free API (this) |
+| [mimo-free-proxy](https://github.com/mmkeeper/mimo-free-proxy) | 8788 | Xiaomi MiMo free API |
+
 ## Как это работает
 
 Сервис открывает окно браузера → ты логинишься в DeepSeek → сохраняет cookies + токен → проксирует запросы к DeepSeek API в формате OpenAI.
@@ -24,6 +34,26 @@ playwright install chromium
 ```
 
 > Нужен Python 3.10+ (скачать: https://python.org)
+
+> **Важно:** Требуется Python 3.10-3.13 для совместимости с wasmer (WASM-солвер для PoW).
+
+### CLI arguments
+
+Все проекты используют одинаковый CLI интерфейс:
+
+```bash
+python server.py --port 18632 --host 127.0.0.1 --proxy socks5://127.0.0.1:9150 --api-key sk-my-key
+```
+
+| Аргумент | По умолчанию | Описание |
+|----------|--------------|----------|
+| `--port` | `18632` | Порт прослушивания |
+| `--host` | `127.0.0.1` | Хост прослушивания |
+| `--proxy` | _(нет)_ | SOCKS5 прокси (например `socks5://127.0.0.1:9150`) |
+| `--api-key` | _(нет)_ | API-ключ для доступа к прокси |
+| `--login` | - | Войти через Playwright |
+| `--connect` | - | Подключиться к Chrome через CDP |
+| `--manual` | - | Инструкция по ручному экспорту |
 
 ### 2. Получить сессию DeepSeek (выбери один способ)
 
@@ -209,3 +239,7 @@ python server.py
 - DeepSeek имеет лимиты на количество запросов с одной сессии (~20-30 в минуту)
 - Не все фичи DeepSeek API доступны через веб-формат (поиск, файлы)
 - Сессию нужно периодически обновлять (раз в несколько дней)
+
+## llama-swap integration
+
+Этот сервер работает с [llama-swap](https://github.com/mmkeeper/llama-swap) как peer. Пример конфигурации см. в `config.yaml` в репо llama-swap.
