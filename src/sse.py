@@ -15,12 +15,13 @@ def parse_sse_event(raw: str) -> dict:
     return event
 
 
-def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[str, int | None]:
+def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[str, str, int | None]:
     message_id = None
     text = ""
+    thinking = ""
 
     def visit(node: Any, path: str):
-        nonlocal message_id, text
+        nonlocal message_id, text, thinking
 
         if isinstance(node, list):
             for i, item in enumerate(node):
@@ -51,7 +52,11 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             and node["p"].endswith("/content")
             and isinstance(node.get("v"), str)
         ):
-            text += node["v"]
+            node_type = node.get("type", "")
+            if "THINK" in node.get("p", "").upper() or node_type == "THINK":
+                thinking += node["v"]
+            else:
+                text += node["v"]
             return
 
         if node.get("o") == "BATCH" and isinstance(node.get("v"), list):
@@ -62,7 +67,6 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
         if isinstance(node.get("content"), str) and node.get("type") in (
             "RESPONSE",
             "TEMPLATE_RESPONSE",
-            "THINK",
         ):
             key = f"{message_id or 'unknown'}:{path}:{node['type']}"
             previous = cache.get(key, "")
@@ -70,6 +74,14 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             delta = current[len(previous) :] if current.startswith(previous) else current
             cache[key] = current
             text += delta
+
+        if isinstance(node.get("content"), str) and node.get("type") == "THINK":
+            key = f"{message_id or 'unknown'}:{path}:THINK"
+            previous = cache.get(key, "")
+            current = node["content"]
+            delta = current[len(previous) :] if current.startswith(previous) else current
+            cache[key] = current
+            thinking += delta
 
         choices = node.get("choices")
         if isinstance(choices, list) and choices:
@@ -83,15 +95,17 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
             visit(item, f"{path}.{key}")
 
     visit(value, "$")
-    return text, message_id
+    return text, thinking, message_id
 
 
 async def stream_sse(
     response,
     on_text: Callable[[str], None] | None = None,
+    on_thinking: Callable[[str], None] | None = None,
     debug: bool = False,
 ) -> dict:
     full_text = ""
+    full_thinking = ""
     last_message_id = None
     fragments: dict[str, str] = {}
     buffer = ""
@@ -124,12 +138,16 @@ async def stream_sse(
             except (json.JSONDecodeError, ValueError):
                 continue
 
-            text, msg_id = extract_delta_text(parsed, fragments, event["event"])
+            text, thinking, msg_id = extract_delta_text(parsed, fragments, event["event"])
             if msg_id is not None:
                 last_message_id = msg_id
             if text:
                 full_text += text
                 if on_text:
                     on_text(text)
+            if thinking:
+                full_thinking += thinking
+                if on_thinking:
+                    on_thinking(thinking)
 
-    return {"lastAssistantMessageId": last_message_id, "text": full_text}
+    return {"lastAssistantMessageId": last_message_id, "text": full_text, "thinking": full_thinking}

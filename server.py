@@ -283,10 +283,15 @@ async def handle_completion(body: dict) -> dict:
 
     # ── Non-streaming ────────────────────────────────────────
     full_text = ""
+    full_thinking = ""
 
     def on_text(text: str):
         nonlocal full_text
         full_text += text
+
+    def on_thinking(text: str):
+        nonlocal full_thinking
+        full_thinking += text
 
     result = await client.complete(
         session_id=session_id,
@@ -296,6 +301,7 @@ async def handle_completion(body: dict) -> dict:
         thinking_enabled=thinking_enabled,
         search_enabled=search_enabled,
         on_text=on_text,
+        on_thinking=on_thinking,
     )
 
     # Store session for reuse — key is hash of user messages including this turn
@@ -306,7 +312,10 @@ async def handle_completion(body: dict) -> dict:
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
-    return {"type": "json", "body": openai_full(chunk_id, created, model, full_text)}
+    response_body = json.loads(openai_full(chunk_id, created, model, full_text))
+    if full_thinking:
+        response_body["thinking"] = full_thinking
+    return {"type": "json", "body": json.dumps(response_body)}
 
 
 # ─── HTTP routes ──────────────────────────────────────────

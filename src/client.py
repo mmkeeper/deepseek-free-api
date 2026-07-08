@@ -102,6 +102,7 @@ class DeepSeekClient:
         thinking_enabled: bool = False,
         search_enabled: bool = False,
         on_text: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
     ) -> dict:
         pow_header = await self.create_pow_header(COMPLETION_PATH)
         body = {
@@ -137,4 +138,4 @@ class DeepSeekClient:
                     pass
                 raise RuntimeError(f"Completion failed: HTTP {resp.status_code}: {text[:1000]}")
 
-            return await stream_sse(resp, on_text=on_text, debug=self.debug)
+            return await stream_sse(resp, on_text=on_text, on_thinking=on_thinking, debug=self.debug)
