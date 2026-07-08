@@ -229,7 +229,7 @@ async def handle_completion(body: dict) -> dict:
         existing = _session_store.get(pkey)
         if existing:
             session_id, parent_message_id = existing
-            prompt = f"User: {last_content}\n\nAssistant:"
+            prompt = last_content
             _log(f"REUSE session {session_id} (parent={parent_message_id})")
         else:
             session_id = await client.create_session()
