@@ -184,6 +184,8 @@ def openai_chunk(chunk_id: str, created: int, model: str, content: str, finish_r
         delta["role"] = "assistant"
     if reasoning_content:
         delta["reasoning_content"] = reasoning_content
+        if "role" not in delta:
+            delta["role"] = "assistant"
     return (
         f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': delta, 'logprobs': None, 'finish_reason': finish_reason}]})}\n\n"
     )
@@ -269,7 +271,7 @@ async def handle_completion(body: dict) -> dict:
                     if not thinking_opened:
                         on_chunk(openai_chunk(chunk_id, created, model, "<think>", None))
                         thinking_opened = True
-                    on_chunk(openai_chunk(chunk_id, created, model, text, None, reasoning_content=text))
+                    on_chunk(openai_chunk(chunk_id, created, model, "", None, reasoning_content=text))
 
                 def on_text_chunk(text: str):
                     nonlocal thinking_opened
