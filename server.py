@@ -203,6 +203,9 @@ async def handle_completion(body: dict) -> dict:
     if "reasoner" in model_lower or "r1" in model_lower:
         model_type = "expert"
 
+    thinking_enabled = body.get("thinking_enabled", False)
+    search_enabled = body.get("search_enabled", False)
+
     client = create_client()
 
     # ── Session reuse logic ──────────────────────────────────
@@ -251,8 +254,8 @@ async def handle_completion(body: dict) -> dict:
                     prompt=prompt,
                     model_type=model_type,
                     parent_message_id=parent_message_id,
-                    thinking_enabled=False,
-                    search_enabled=False,
+                    thinking_enabled=thinking_enabled,
+                    search_enabled=search_enabled,
                     on_text=lambda text: on_chunk(openai_chunk(chunk_id, created, model, text, None)),
                 )
 
@@ -282,8 +285,8 @@ async def handle_completion(body: dict) -> dict:
         prompt=prompt,
         model_type=model_type,
         parent_message_id=parent_message_id,
-        thinking_enabled=False,
-        search_enabled=False,
+        thinking_enabled=thinking_enabled,
+        search_enabled=search_enabled,
         on_text=on_text,
     )
 
