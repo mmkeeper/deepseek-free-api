@@ -383,6 +383,28 @@ async def run_server(port: int, host: str):
         await runner.cleanup()
 
 
+async def validate_and_login():
+    saved = read_saved_auth()
+    if saved:
+        auth["cookieHeader"] = saved["cookieHeader"]
+        auth["token"] = saved["token"]
+        print("[auth] Загружена сохранённая авторизация, проверяю...")
+        try:
+            client = create_client()
+            await client.create_session()
+            print("[auth] Токен валиден")
+            return
+        except AuthError:
+            print("[auth] Токен истёк, открываю окно логина...")
+        except Exception as e:
+            print(f"[auth] Ошибка проверки: {e}, открываю окно логина...")
+
+    result = await login_and_save_auth()
+    auth["cookieHeader"] = result["cookieHeader"]
+    auth["token"] = result["token"]
+    print("[auth] Авторизация получена")
+
+
 def main():
     args = parse_args()
 
