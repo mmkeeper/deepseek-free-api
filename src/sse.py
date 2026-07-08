@@ -20,6 +20,13 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
     text = ""
     thinking = ""
 
+    # Track fragment types in order — list of "THINK" or "RESPONSE" strings.
+    # Updated from SNAPSHOT events; used to classify APPEND to fragments/-1.
+    frag_types: list[str] = cache.setdefault("_frag_types", [])
+    # Track content per fragment for delta calculation.
+    # Keyed by fragment id, value is the full content string.
+    frag_content: dict[int, str] = cache.setdefault("_frag_content", {})
+
     def visit(node: Any, path: str):
         nonlocal message_id, text, thinking
 
@@ -38,51 +45,85 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
         if isinstance(node.get("id"), int) and node.get("role") == "ASSISTANT":
             message_id = node["id"]
 
+        # Simple {"v": "text"} — raw token from the active fragment
         if (
             path == "$"
             and len(node) == 1
             and isinstance(node.get("v"), str)
         ):
-            text += node["v"]
-            return
-
-        if (
-            node.get("o") == "APPEND"
-            and isinstance(node.get("p"), str)
-            and node["p"].endswith("/content")
-            and isinstance(node.get("v"), str)
-        ):
-            node_type = node.get("type", "")
-            if "THINK" in node.get("p", "").upper() or node_type == "THINK":
+            if frag_types and frag_types[-1] == "THINK":
                 thinking += node["v"]
             else:
                 text += node["v"]
             return
 
+        # APPEND to fragment content: {"p": "response/fragments/-1/content", "o": "APPEND", "v": "..."}
+        if (
+            node.get("o") == "APPEND"
+            and isinstance(node.get("p"), str)
+            and "fragments" in node["p"]
+            and node["p"].endswith("content")
+            and isinstance(node.get("v"), str)
+        ):
+            if frag_types and frag_types[-1] == "THINK":
+                thinking += node["v"]
+            else:
+                text += node["v"]
+            return
+
+        # APPEND new fragment(s): {"p": "response/fragments", "o": "APPEND", "v": [{...}]}
+        if (
+            node.get("o") == "APPEND"
+            and isinstance(node.get("p"), str)
+            and node["p"].endswith("fragments")
+            and isinstance(node.get("v"), list)
+        ):
+            for frag in node["v"]:
+                if isinstance(frag, dict) and isinstance(frag.get("type"), str):
+                    frag_types.append(frag["type"])
+                    fid = frag.get("id")
+                    fcontent = frag.get("content", "")
+                    if isinstance(fid, int) and isinstance(fcontent, str):
+                        frag_content[fid] = fcontent
+                        if frag["type"] == "THINK":
+                            thinking += fcontent
+                        else:
+                            text += fcontent
+            return
+
+        # BATCH: {"o": "BATCH", "v": [...]}
         if node.get("o") == "BATCH" and isinstance(node.get("v"), list):
             for i, item in enumerate(node["v"]):
                 visit(item, f"{path}.v.{i}")
             return
 
-        if isinstance(node.get("content"), str) and node.get("type") in (
-            "RESPONSE",
-            "TEMPLATE_RESPONSE",
-        ):
-            key = f"{message_id or 'unknown'}:{path}:{node['type']}"
-            previous = cache.get(key, "")
-            current = node["content"]
-            delta = current[len(previous) :] if current.startswith(previous) else current
-            cache[key] = current
-            text += delta
+        # SNAPSHOT with fragments — update frag_types and compute deltas
+        # Structure: {"v": {"response": {"fragments": [...]}}}
+        resp = node.get("v", {})
+        if isinstance(resp, dict):
+            resp = resp.get("response", resp)
+        if isinstance(resp, dict) and isinstance(resp.get("fragments"), list):
+            new_types = []
+            for frag in resp["fragments"]:
+                if isinstance(frag, dict) and isinstance(frag.get("type"), str):
+                    new_types.append(frag["type"])
+                    fid = frag.get("id")
+                    fcontent = frag.get("content", "")
+                    if isinstance(fid, int) and isinstance(fcontent, str):
+                        prev = frag_content.get(fid, "")
+                        if fcontent.startswith(prev):
+                            delta = fcontent[len(prev):]
+                        else:
+                            delta = fcontent
+                        frag_content[fid] = fcontent
+                        if frag["type"] == "THINK":
+                            thinking += delta
+                        elif frag["type"] in ("RESPONSE", "TEMPLATE_RESPONSE"):
+                            text += delta
+            if new_types:
+                frag_types[:] = new_types
 
-        if isinstance(node.get("content"), str) and node.get("type") == "THINK":
-            key = f"{message_id or 'unknown'}:{path}:THINK"
-            previous = cache.get(key, "")
-            current = node["content"]
-            delta = current[len(previous) :] if current.startswith(previous) else current
-            cache[key] = current
-            thinking += delta
-
+        # OpenAI-style choices
         choices = node.get("choices")
         if isinstance(choices, list) and choices:
             delta = choices[0].get("delta")
@@ -90,7 +131,7 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
                 text += delta["content"]
 
         for key, item in node.items():
-            if key in ("content", "choices"):
+            if key in ("content", "choices", "v"):
                 continue
             visit(item, f"{path}.{key}")
 
