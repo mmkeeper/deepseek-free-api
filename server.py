@@ -171,7 +171,7 @@ async def handle_completion(body: dict) -> dict:
     model_lower = (model or "").lower()
     model_type = None
     if "reasoner" in model_lower or "r1" in model_lower:
-        model_type = "deepseek-reasoner"
+        model_type = "expert"
 
     if stream:
         async def run_stream(on_chunk, on_done, on_error):
