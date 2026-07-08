@@ -162,9 +162,6 @@ async def _wait_for_auth(context, timeout_s: int = 300, settle_s: float = 0.8):
             auth_hdr = req_headers.get("authorization") or req_headers.get("Authorization")
             if not auth_hdr or not auth_hdr.startswith("Bearer ") or len(auth_hdr) < 20:
                 return
-            body = response.json()
-            if body and body.get("code") is not None and body["code"] != 0:
-                return
             result["ok"] = True
             done.set()
         except Exception:
