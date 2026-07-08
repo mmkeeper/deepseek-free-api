@@ -57,12 +57,18 @@ class DeepSeekClient:
 
     async def create_session(self) -> str:
         data = await self._request("/api/v0/chat_session/create", "POST", {})
-        session = data.get("data", {}).get("biz_data", {}).get("chat_session", {})
-        if not session.get("id"):
+        biz_data = data.get("data", {}).get("biz_data", {})
+        # New API: session id is directly in biz_data.id
+        session_id = biz_data.get("id")
+        if not session_id:
+            # Old API: nested in chat_session
+            session = biz_data.get("chat_session", {})
+            session_id = session.get("id")
+        if not session_id:
             raise RuntimeError(
                 f"Cannot read chat session id: {json.dumps(data)[:300]}"
             )
-        return session["id"]
+        return session_id
 
     async def create_pow_header(self, target_path: str) -> str:
         data = await self._request(
@@ -114,21 +120,21 @@ class DeepSeekClient:
         headers = {**self._build_headers(), "X-DS-PoW-Response": pow_header}
         content = json.dumps(body)
 
-        resp = await client.request("POST", url, headers=headers, content=content)
-
-        content_type = resp.headers.get("content-type", "")
-        if resp.is_error or "text/event-stream" not in content_type:
-            text = resp.text
-            if resp.status_code in (401, 403):
-                raise AuthError("completion")
-            try:
-                parsed = json.loads(text)
-                if parsed.get("code") in (40002, 40003):
+        async with client.stream("POST", url, headers=headers, content=content) as resp:
+            content_type = resp.headers.get("content-type", "")
+            if resp.status_code >= 400 or "text/event-stream" not in content_type:
+                text = await resp.aread()
+                text = text.decode("utf-8", errors="replace")
+                if resp.status_code in (401, 403):
                     raise AuthError("completion")
-            except AuthError:
-                raise
-            except (json.JSONDecodeError, ValueError):
-                pass
-            raise RuntimeError(f"Completion failed: HTTP {resp.status_code}: {text[:1000]}")
+                try:
+                    parsed = json.loads(text)
+                    if parsed.get("code") in (40002, 40003):
+                        raise AuthError("completion")
+                except AuthError:
+                    raise
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                raise RuntimeError(f"Completion failed: HTTP {resp.status_code}: {text[:1000]}")
 
-        return await stream_sse(resp, on_text=on_text, debug=self.debug)
+            return await stream_sse(resp, on_text=on_text, debug=self.debug)
