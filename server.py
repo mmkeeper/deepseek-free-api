@@ -123,17 +123,14 @@ def create_client() -> DeepSeekClient:
 _session_store: dict[str, tuple[str, int | None]] = {}
 
 
-def _conversation_key(messages: list[dict]) -> str:
-    """Key by the first user message content — stable across turns."""
-    for m in messages:
-        if m.get("role") == "user":
-            c = m.get("content", "")
-            if isinstance(c, list):
-                c = "\n".join(
-                    item.get("text", "") for item in c if item.get("type") == "text"
-                )
-            return hashlib.sha256(c.encode()).hexdigest()[:16]
-    return hashlib.sha256(b"").hexdigest()[:16]
+def _hash_messages(msgs: list[dict]) -> str:
+    raw = json.dumps(msgs, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _prefix_key(messages: list[dict]) -> str:
+    """Hash of messages[:-1] — the conversation prefix before the latest user turn."""
+    return _hash_messages(messages[:-1]) if len(messages) >= 1 else _hash_messages([])
 
 
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
@@ -209,8 +206,8 @@ async def handle_completion(body: dict) -> dict:
     parent_message_id: int | None = None
 
     if last_msg.get("role") == "user":
-        key = _conversation_key(messages)
-        existing = _session_store.get(key)
+        pkey = _prefix_key(messages)
+        existing = _session_store.get(pkey)
         if existing:
             session_id, parent_message_id = existing
             prompt = f"User: {last_content}\n\nAssistant:"
@@ -240,10 +237,12 @@ async def handle_completion(body: dict) -> dict:
                     on_text=lambda text: on_chunk(openai_chunk(chunk_id, created, model, text, None)),
                 )
 
-                # Store session for reuse
+                # Store session for reuse — key is hash of messages + this response
                 if result and result.get("lastAssistantMessageId"):
-                    key = _conversation_key(messages)
-                    _session_store[key] = (session_id, result["lastAssistantMessageId"])
+                    full = messages + [{"role": "assistant", "content": result.get("text", "")}]
+                    nkey = _hash_messages(full)
+                    _session_store[nkey] = (session_id, result["lastAssistantMessageId"])
+                    print(f"[session] Stored session {session_id} under {nkey}")
 
                 on_chunk(openai_chunk(chunk_id, created, model, "", "stop"))
                 on_chunk(openai_done())
@@ -270,10 +269,12 @@ async def handle_completion(body: dict) -> dict:
         on_text=on_text,
     )
 
-    # Store session for reuse
+    # Store session for reuse — key is hash of messages + this response
     if result and result.get("lastAssistantMessageId"):
-        key = _conversation_key(messages)
-        _session_store[key] = (session_id, result["lastAssistantMessageId"])
+        full = messages + [{"role": "assistant", "content": full_text}]
+        nkey = _hash_messages(full)
+        _session_store[nkey] = (session_id, result["lastAssistantMessageId"])
+        print(f"[session] Stored session {session_id} under {nkey}")
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
