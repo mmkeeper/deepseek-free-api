@@ -45,13 +45,16 @@ def parse_args() -> argparse.Namespace:
   python server.py --login                  Войти через Playwright
   python server.py --connect                Забрать сессию из Chrome
   python server.py --proxy 127.0.0.1:1080   Через SOCKS5 прокси
-  python server.py --proxy socks5://user:pass@10.0.0.1:1080
+  python server.py --no-thinking            Выключить мышление по умолчанию
+  python server.py --no-search              Выключить поиск по умолчанию
 """,
     )
     p.add_argument("--port", type=int, default=None, help="Listen port (default: 18632)")
     p.add_argument("--host", default=None, help="Listen host (default: 0.0.0.0)")
     p.add_argument("--proxy", default=None, help="SOCKS5 proxy (socks5://host:port)")
     p.add_argument("--api-key", default=None, help="API key for client auth")
+    p.add_argument("--no-thinking", action="store_true", help="Disable thinking by default")
+    p.add_argument("--no-search", action="store_true", help="Disable search by default")
     p.add_argument("--login", action="store_true", help="Логин через Playwright")
     p.add_argument("--connect", nargs="?", const=9222, type=int, metavar="PORT",
                    help="Подключиться к Chrome через CDP")
@@ -65,6 +68,11 @@ def parse_args() -> argparse.Namespace:
 # ─── Auth state ───────────────────────────────────────────
 
 auth = {"cookieHeader": "", "token": ""}
+
+# ─── Feature defaults (overridden by CLI args) ─────────────
+
+default_thinking = True
+default_search = True
 
 
 async def init_auth(force_login: bool = False):
@@ -203,8 +211,8 @@ async def handle_completion(body: dict) -> dict:
     if "reasoner" in model_lower or "r1" in model_lower:
         model_type = "expert"
 
-    thinking_enabled = body.get("thinking_enabled", False)
-    search_enabled = body.get("search_enabled", False)
+    thinking_enabled = body.get("thinking_enabled", default_thinking)
+    search_enabled = body.get("search_enabled", default_search)
 
     client = create_client()
 
@@ -502,7 +510,11 @@ async def validate_and_login():
 
 
 def main():
+    global default_thinking, default_search
     args = parse_args()
+
+    default_thinking = not args.no_thinking
+    default_search = not args.no_search
 
     if args.proxy:
         import os
