@@ -45,6 +45,20 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
         if isinstance(node.get("id"), int) and node.get("role") == "ASSISTANT":
             message_id = node["id"]
 
+        # Content update without "o" marker: {"p": "response/fragments/-1/content", "v": "..."}
+        if (
+            path == "$"
+            and isinstance(node.get("p"), str)
+            and "content" in node["p"]
+            and isinstance(node.get("v"), str)
+            and "o" not in node
+        ):
+            if frag_types and frag_types[-1] == "THINK":
+                thinking += node["v"]
+            else:
+                text += node["v"]
+            return
+
         # Simple {"v": "text"} — raw token from the active fragment
         if (
             path == "$"
