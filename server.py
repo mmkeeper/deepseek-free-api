@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -117,6 +118,24 @@ def create_client() -> DeepSeekClient:
     )
 
 
+# ─── Session store (reuse DeepSeek sessions within one server run) ───
+
+_session_store: dict[str, tuple[str, int | None]] = {}
+
+
+def _conversation_key(messages: list[dict]) -> str:
+    """Key by the first user message content — stable across turns."""
+    for m in messages:
+        if m.get("role") == "user":
+            c = m.get("content", "")
+            if isinstance(c, list):
+                c = "\n".join(
+                    item.get("text", "") for item in c if item.get("type") == "text"
+                )
+            return hashlib.sha256(c.encode()).hexdigest()[:16]
+    return hashlib.sha256(b"").hexdigest()[:16]
+
+
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
 
 def messages_to_prompt(messages: list[dict]) -> str:
@@ -163,16 +182,47 @@ async def handle_completion(body: dict) -> dict:
     messages = body.get("messages", [])
     stream = body.get("stream", False)
     model = body.get("model", "deepseek-chat")
-    prompt = messages_to_prompt(messages)
-
-    client = create_client()
-    session_id = await client.create_session()
 
     model_lower = (model or "").lower()
     model_type = None
     if "reasoner" in model_lower or "r1" in model_lower:
         model_type = "expert"
 
+    client = create_client()
+
+    # ── Session reuse logic ──────────────────────────────────
+    # Hash all messages except the last to identify the conversation prefix.
+    # If we've seen this prefix before, reuse the session and send only the
+    # new user message with parent_message_id.
+    last_msg = messages[-1] if messages else {}
+    last_content = ""
+    c = last_msg.get("content")
+    if isinstance(c, str):
+        last_content = c
+    elif isinstance(c, list):
+        last_content = "\n".join(
+            item["text"] for item in c if item.get("type") == "text"
+        )
+
+    session_id: str
+    prompt: str
+    parent_message_id: int | None = None
+
+    if last_msg.get("role") == "user":
+        key = _conversation_key(messages)
+        existing = _session_store.get(key)
+        if existing:
+            session_id, parent_message_id = existing
+            prompt = f"User: {last_content}\n\nAssistant:"
+            print(f"[session] Reuse session {session_id} (parent={parent_message_id})")
+        else:
+            session_id = await client.create_session()
+            prompt = messages_to_prompt(messages)
+    else:
+        session_id = await client.create_session()
+        prompt = messages_to_prompt(messages)
+
+    # ── Streaming ────────────────────────────────────────────
     if stream:
         async def run_stream(on_chunk, on_done, on_error):
             try:
@@ -180,14 +230,20 @@ async def handle_completion(body: dict) -> dict:
                 created = int(time.time())
                 on_chunk(openai_chunk(chunk_id, created, model, "", None))
 
-                await client.complete(
+                result = await client.complete(
                     session_id=session_id,
                     prompt=prompt,
                     model_type=model_type,
+                    parent_message_id=parent_message_id,
                     thinking_enabled=False,
                     search_enabled=False,
                     on_text=lambda text: on_chunk(openai_chunk(chunk_id, created, model, text, None)),
                 )
+
+                # Store session for reuse
+                if result and result.get("lastAssistantMessageId"):
+                    key = _conversation_key(messages)
+                    _session_store[key] = (session_id, result["lastAssistantMessageId"])
 
                 on_chunk(openai_chunk(chunk_id, created, model, "", "stop"))
                 on_chunk(openai_done())
@@ -197,20 +253,27 @@ async def handle_completion(body: dict) -> dict:
 
         return {"type": "stream", "run": run_stream}
 
+    # ── Non-streaming ────────────────────────────────────────
     full_text = ""
 
     def on_text(text: str):
         nonlocal full_text
         full_text += text
 
-    await client.complete(
+    result = await client.complete(
         session_id=session_id,
         prompt=prompt,
         model_type=model_type,
+        parent_message_id=parent_message_id,
         thinking_enabled=False,
         search_enabled=False,
         on_text=on_text,
     )
+
+    # Store session for reuse
+    if result and result.get("lastAssistantMessageId"):
+        key = _conversation_key(messages)
+        _session_store[key] = (session_id, result["lastAssistantMessageId"])
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
