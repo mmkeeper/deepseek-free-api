@@ -122,7 +122,7 @@ def create_client() -> DeepSeekClient:
     return DeepSeekClient(
         cookie_header=auth["cookieHeader"],
         token=auth["token"],
-        debug=False,
+        debug=True,
     )
 
 
