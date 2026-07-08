@@ -270,37 +270,47 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
 
+    write_queue = asyncio.Queue()
     closed = False
 
-    async def safe_write(data: bytes):
+    async def writer():
         nonlocal closed
-        if not closed:
+        while True:
+            data = await write_queue.get()
+            if data is None:
+                break
             try:
                 await response.write(data)
             except Exception:
                 closed = True
+                break
+        if not closed:
+            try:
+                await response.write(b"data: [DONE]\n\n")
+                await response.write_eof()
+            except Exception:
+                pass
+
+    writer_task = asyncio.create_task(writer())
 
     def on_chunk(chunk: str):
-        asyncio.ensure_future(safe_write(chunk.encode("utf-8")))
+        if not closed:
+            write_queue.put_nowait(chunk.encode("utf-8"))
 
     def on_done():
-        nonlocal closed
-        if not closed:
-            asyncio.ensure_future(safe_write(b"data: [DONE]\n\n"))
-            asyncio.ensure_future(response.write_eof())
-            closed = True
+        write_queue.put_nowait(None)
 
     def on_error(error: Exception):
         nonlocal closed
+        print(f"[stream] {error}", file=sys.stderr)
         if not closed:
-            print(f"[stream] {error}", file=sys.stderr)
             err_data = json.dumps({"error": str(error)})
-            asyncio.ensure_future(safe_write(f"data: {err_data}\n\n".encode("utf-8")))
-            asyncio.ensure_future(response.write_eof())
-            closed = True
+            write_queue.put_nowait(f"data: {err_data}\n\n".encode("utf-8"))
+            write_queue.put_nowait(None)
 
     asyncio.create_task(result["run"](on_chunk, on_done, on_error))
 
+    await writer_task
     return response
 
 
