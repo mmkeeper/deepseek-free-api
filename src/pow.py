@@ -16,25 +16,32 @@ class DeepSeekHash:
         self.exports = instance.exports
         self.memory = self.exports.memory
         self._offset = 0
+        self._alloc = getattr(self.exports, '__wbindgen_export_0')
+        self._stack_grow = getattr(self.exports, '__wbindgen_add_to_stack_pointer')
 
     @classmethod
     async def create(cls, wasm_url: str) -> "DeepSeekHash":
-        from wasmer import Engine, Instance, Module, Store
-
         client = get_http_client()
         resp = await client.get(wasm_url)
         resp.raise_for_status()
 
-        engine = Engine()
-        store = Store(engine)
-        module = Module(store, resp.content)
-        instance = Instance(store, module)
+        try:
+            from wasmer import Engine, Instance, Module, Store
+            engine = Engine()
+            store = Store(engine)
+            module = Module(store, resp.content)
+            instance = Instance(store, module)
+        except (ImportError, TypeError):
+            from wasmer import Instance, Module, Store
+            store = Store()
+            module = Module(store, resp.content)
+            instance = Instance(module)
         return cls(instance)
 
     def _write_string(self, text: str) -> tuple[int, int]:
         data = text.encode("utf-8")
         length = len(data)
-        ptr = self.exports.__wbindgen_export_0(length, 1)
+        ptr = self._alloc(length, 1)
         mem = self.memory.uint8_view()
         mem[ptr : ptr + length] = data
         return ptr, length
@@ -47,14 +54,14 @@ class DeepSeekHash:
 
         prefix = f"{salt}_{expire_at}_"
 
-        retptr = self.exports.__wbindgen_add_to_stack_pointer(-16)
+        retptr = self._stack_grow(-16)
         try:
             ptr0, len0 = self._write_string(challenge)
             ptr1, len1 = self._write_string(prefix)
 
-            self.exports.wasm_solve(retptr, ptr0, len0, ptr1, len1, difficulty)
+            self.exports.wasm_solve(retptr, ptr0, len0, ptr1, len1, float(difficulty))
 
-            buf = self.memory.buffer
+            buf = bytes(self.memory.buffer)
             status = struct.unpack_from("<i", buf, retptr)[0]
             value_bytes = buf[retptr + 8 : retptr + 16]
             value = struct.unpack("<d", value_bytes)[0]
@@ -63,7 +70,7 @@ class DeepSeekHash:
                 raise ValueError("PoW solver returned status 0 (failure)")
             return int(value)
         finally:
-            self.exports.__wbindgen_add_to_stack_pointer(16)
+            self._stack_grow(16)
 
 
 async def get_wasm_solver() -> DeepSeekHash:
