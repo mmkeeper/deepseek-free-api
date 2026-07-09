@@ -214,7 +214,7 @@ curl http://localhost:18632/v1/chat/completions \
 |---|---|---|---|
 | `dsf-deepseek-chat` | DeepSeek V3 / V4 (обычный чат) | ✅ | ✅ |
 | `dsf-deepseek-reasoner` | DeepSeek R1 (с рассуждением) | ✅ | ✅ |
-| `dsf-deepseek-r1` | Алиас deepseek-reasoner | ✅ | ✅ |
+| `dsf-deepseek-vision` | DeepSeek Vision (анализ изображений) | ⚠️ требует загрузку файлов | ✅ |
 
 > Префикс `dsf-` используется для совместимости с другими провайдерами в инструментах вроде Hermes. Префикс автоматически снимается перед отправкой в upstream.
 
