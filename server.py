@@ -141,6 +141,10 @@ def _log(msg: str):
     _log_file.write(msg + "\n")
     _log_file.flush()
 
+PREFIX = "dsf-"
+
+def strip_prefix(model: str) -> str:
+    return model[len(PREFIX):] if model.startswith(PREFIX) else model
 
 def _hash_messages(msgs: list[dict]) -> str:
     raw = json.dumps(msgs, sort_keys=True, ensure_ascii=False)
@@ -211,7 +215,7 @@ def openai_full(chunk_id: str, created: int, model: str, content: str) -> str:
 async def handle_completion(body: dict) -> dict:
     messages = body.get("messages", [])
     stream = body.get("stream", False)
-    model = body.get("model", "deepseek-chat")
+    model = strip_prefix(body.get("model", "deepseek-chat"))
 
     model_lower = (model or "").lower()
     model_type = "default"
@@ -355,9 +359,9 @@ async def handle_options(request: web.Request) -> web.Response:
 async def handle_models(request: web.Request) -> web.Response:
     now = int(time.time() * 1000)
     models = [
-        {"id": "deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek"},
-        {"id": "deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
-        {"id": "deepseek-r1", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": f"{PREFIX}deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": f"{PREFIX}deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": f"{PREFIX}deepseek-r1", "object": "model", "created": now, "owned_by": "deepseek"},
     ]
     return web.json_response({"object": "list", "data": models})
 
