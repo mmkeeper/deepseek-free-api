@@ -174,9 +174,17 @@ def messages_to_prompt(messages: list[dict]) -> str:
         if isinstance(c, str):
             content = c
         elif isinstance(c, list):
-            content = "\n".join(
-                item["text"] for item in c if item.get("type") == "text"
-            )
+            # Extract text and check for images
+            texts = []
+            has_images = False
+            for item in c:
+                if item.get("type") == "text":
+                    texts.append(item.get("text", ""))
+                elif item.get("type") == "image_url":
+                    has_images = True
+            content = "\n".join(texts)
+            if has_images:
+                _log(f"WARNING: Image content in messages_to_prompt - images not supported")
         parts.append(f"{role}: {content}")
     return "\n\n".join(parts) + "\n\nAssistant:"
 
@@ -221,6 +229,8 @@ async def handle_completion(body: dict) -> dict:
     model_type = "default"
     if "reasoner" in model_lower or "r1" in model_lower:
         model_type = "expert"
+    elif "vision" in model_lower:
+        model_type = "vision"
 
     thinking_enabled = body.get("thinking_enabled", default_thinking)
     search_enabled = body.get("search_enabled", default_search)
@@ -234,12 +244,27 @@ async def handle_completion(body: dict) -> dict:
     last_msg = messages[-1] if messages else {}
     last_content = ""
     c = last_msg.get("content")
+    _log(f"CONTENT type={type(c).__name__} value={str(c)[:500]}")
     if isinstance(c, str):
         last_content = c
     elif isinstance(c, list):
-        last_content = "\n".join(
-            item["text"] for item in c if item.get("type") == "text"
-        )
+        # Extract text and check for images
+        texts = []
+        has_images = False
+        for item in c:
+            _log(f"  ITEM type={item.get('type')} keys={list(item.keys())}")
+            if item.get("type") == "text":
+                texts.append(item.get("text", ""))
+            elif item.get("type") == "image_url":
+                has_images = True
+                url = item.get("image_url", {}).get("url", "")
+                _log(f"  IMAGE url_len={len(url)} prefix={url[:50]}")
+            elif item.get("type") == "image":
+                has_images = True
+                _log(f"  IMAGE type=image keys={list(item.keys())}")
+        last_content = "\n".join(texts)
+        if has_images:
+            _log(f"WARNING: Image content detected but not supported - only text will be sent")
 
     session_id: str
     prompt: str
@@ -361,7 +386,7 @@ async def handle_models(request: web.Request) -> web.Response:
     models = [
         {"id": f"{PREFIX}deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek"},
         {"id": f"{PREFIX}deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
-        {"id": f"{PREFIX}deepseek-r1", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": f"{PREFIX}deepseek-vision", "object": "model", "created": now, "owned_by": "deepseek"},
     ]
     return web.json_response({"object": "list", "data": models})
 
@@ -502,8 +527,8 @@ async def run_server(port: int, host: str):
 ╔══════════════════════════════════════════════════╗
 ║     DeepSeek Free -> OpenAI Proxy                ║
 ║══════════════════════════════════════════════════║
-║  Порт:    {str(port):<39}║
-║  Хост:    {host:<39}║
+║  Port:    {str(port):<39}║
+║  Host:    {host:<39}║
 ║  {proxy_line:<47}║
 ║══════════════════════════════════════════════════║
 ║  POST http://localhost:{port}/v1/chat/completions    ║
