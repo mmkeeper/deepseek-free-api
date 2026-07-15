@@ -15,9 +15,14 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
+import os
+import re
 import sys
 import time
 from pathlib import Path
+
+DEBUG = False  # Переключи в True для отладки или используй --debug
 
 from aiohttp import web
 
@@ -62,6 +67,8 @@ def parse_args() -> argparse.Namespace:
                    help="Импорт cookies.json + userToken")
     p.add_argument("--manual", action="store_true",
                    help="Показать инструкцию по ручному экспорту")
+    p.add_argument("--debug", action="store_true",
+                   help="Включить отладочное логирование в файл")
     return p.parse_args()
 
 
@@ -128,18 +135,21 @@ def create_client() -> DeepSeekClient:
 
 # ─── Session store (reuse DeepSeek sessions within one server run) ───
 
-_session_store: dict[str, tuple[str, int | None]] = {}
+_session_store: dict[str, tuple[str, int | None, bool]] = {}
 
-_log_file = None
+log = logging.getLogger("ds")
 
 
-def _log(msg: str):
-    global _log_file
-    if _log_file is None:
-        import tempfile, os
-        _log_file = open(os.path.join(tempfile.gettempdir(), "ds_session.log"), "a", encoding="utf-8")
-    _log_file.write(msg + "\n")
-    _log_file.flush()
+def setup_logging(enabled: bool):
+    if not enabled:
+        logging.disable(logging.CRITICAL)
+        return
+    import tempfile
+    log_path = os.path.join(tempfile.gettempdir(), "ds_session.log")
+    h = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    h.setLevel(logging.DEBUG)
+    log.setLevel(logging.DEBUG)
+    log.addHandler(h)
 
 PREFIX = "dsf-"
 
@@ -165,10 +175,42 @@ def _prefix_key(messages: list[dict]) -> str:
 
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
 
-def messages_to_prompt(messages: list[dict]) -> str:
+def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
     parts = []
+    if tools:
+        tool_names = [t.get("function", {}).get("name", "unknown") for t in tools]
+        tool_descs = []
+        for t in tools:
+            func = t.get("function", {})
+            name = func.get("name", "unknown")
+            desc = func.get("description", "")
+            params = func.get("parameters", {})
+            param_props = params.get("properties", {})
+            param_names = list(param_props.keys())
+            tool_descs.append(f"  - {name}: {desc} (params: {param_names})")
+        tools_text = chr(10).join(tool_descs)
+        tool_names_str = ", ".join(tool_names)
+        lt = chr(60)
+        gt = chr(62)
+        tc_open = lt + "tool_calls" + gt
+        tc_close = lt + "/tool_calls" + gt
+        inv_open = lt + "invoke" + gt
+        inv_close = lt + "/invoke" + gt
+        param_open = lt + "parameter" + gt
+        param_close = lt + "/parameter" + gt
+        tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
+        tool_header += tc_open + chr(10)
+        tool_header += "  " + inv_open + chr(32) + "name=" + chr(34) + "TOOL_NAME" + chr(34) + chr(32) + inv_close + chr(10)
+        tool_header += "    " + param_open + chr(32) + "name=" + chr(34) + "PARAM_NAME" + chr(34) + chr(32) + param_close + " VALUE " + lt + "/parameter" + gt + chr(10)
+        tool_header += "  " + lt + "/invoke" + gt + chr(10)
+        tool_header += tc_close + chr(10)
+        tool_header += "Available tools: " + tool_names_str + chr(10)
+        tool_header += tools_text + chr(10)
+        tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
+        tool_header += chr(10)
     for m in messages:
-        role = "Assistant" if m.get("role") == "assistant" else "User"
+        role_map = {"assistant": "Assistant", "system": "System"}
+        role = role_map.get(m.get("role"), "User")
         content = ""
         c = m.get("content")
         if isinstance(c, str):
@@ -184,7 +226,7 @@ def messages_to_prompt(messages: list[dict]) -> str:
                     has_images = True
             content = "\n".join(texts)
             if has_images:
-                _log(f"WARNING: Image content in messages_to_prompt - images not supported")
+                log.debug(f"WARNING: Image content in messages_to_prompt - images not supported")
         parts.append(f"{role}: {content}")
     return "\n\n".join(parts) + "\n\nAssistant:"
 
@@ -207,6 +249,204 @@ def openai_done() -> str:
     return "data: [DONE]\n\n"
 
 
+def openai_tool_calls_chunk(chunk_id, created, model, tool_calls):
+    """Generate OpenAI chunk with tool_calls in delta."""
+    formatted_calls = []
+    for i, tc in enumerate(tool_calls):
+        formatted_calls.append({
+            "index": i,
+            "id": f"call_{hash(tc['name']) % 100000:05d}",
+            "type": "function",
+            "function": {
+                "name": tc["name"],
+                "arguments": tc["arguments"]
+            }
+        })
+    return json.dumps({
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": formatted_calls},
+            "logprobs": None,
+            "finish_reason": "tool_calls"
+        }]
+    }) + "\n\n"
+
+
+def openai_tool_calls_response(chunk_id, created, model, tool_calls):
+    """Generate full OpenAI response with tool_calls."""
+    formatted_calls = []
+    for i, tc in enumerate(tool_calls):
+        formatted_calls.append({
+            "index": i,
+            "id": f"call_{hash(tc['name']) % 100000:05d}",
+            "type": "function",
+            "function": {
+                "name": tc["name"],
+                "arguments": tc["arguments"]
+            }
+        })
+    return json.dumps({
+        "id": chunk_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": formatted_calls
+            },
+            "logprobs": None,
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    })
+
+
+def parse_tool_calls(text, available_tools=None):
+    """Parse tool calls from LLM text output."""
+    import re, json
+    tool_calls = []
+    available_names = set()
+    if available_tools:
+        for t in available_tools:
+            if t.get("type") == "function":
+                fn = t.get("function", {})
+                name = fn.get("name", "")
+                if name:
+                    available_names.add(name)
+
+    skip = {"thinking", "think", "tool_calls"}
+
+    def _valid(name):
+        if not name or name.lower() in skip:
+            return False
+        if available_names and name not in available_names:
+            return False
+        return True
+
+    def _clean(s):
+        return s.strip().strip(chr(34)).strip(chr(39)).strip(",")
+
+    def _parse_props(txt):
+        result = {}
+        param_pat = '<parameter name="([^"]+)">(.*?)</parameter>'
+        param_pat2 = '<param name="([^"]+)">(.*?)</param>'
+        for m in re.finditer(param_pat, txt, re.DOTALL):
+            result[m.group(1)] = _clean(m.group(2))
+        if not result:
+            for m in re.finditer(param_pat2, txt, re.DOTALL):
+                result[m.group(1)] = _clean(m.group(2))
+        if not result:
+            try:
+                c = txt.strip()
+                if c.startswith("{"):
+                    result = json.loads(c)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if not result:
+            attr_pat = r"(\w+)\s*=\s*" + chr(34) + '([^"]*)' + chr(34)
+            for m in re.finditer(attr_pat, txt):
+                result[m.group(1)] = m.group(2)
+        return result
+
+    # Format 1: invoke with parameter tags
+    for m in re.finditer('<invoke name="([^"]+)">(.*?)</invoke>', text, re.DOTALL):
+        name, props = m.group(1), m.group(2)
+        if _valid(name):
+            args = _parse_props(props)
+            if args:
+                tool_calls.append({"name": name, "arguments": json.dumps(args)})
+
+    # Format 2: tool_calls wrapper with invoke
+    if not tool_calls:
+        tc = re.search('<tool_calls>(.*?)</tool_calls>', text, re.DOTALL)
+        if tc:
+            for m in re.finditer('<invoke name="([^"]+)">(.*?)</invoke>', tc.group(1), re.DOTALL):
+                name, props = m.group(1), m.group(2)
+                if _valid(name):
+                    args = _parse_props(props)
+                    if args:
+                        tool_calls.append({"name": name, "arguments": json.dumps(args)})
+
+    # Format 3: tool_calls with JSON
+    if not tool_calls:
+        tc = re.search('<tool_calls>(.*?)</tool_calls>', text, re.DOTALL)
+        if tc:
+            try:
+                p = json.loads(tc.group(1).strip())
+                if isinstance(p, dict) and "name" in p:
+                    if _valid(p['name']):
+                        args = p.get('arguments', {})
+                        if isinstance(args, dict): args = json.dumps(args)
+                        tool_calls.append({"name": p["name"], "arguments": args})
+                elif isinstance(p, list):
+                    for item in p:
+                        if isinstance(item, dict) and "name" in item:
+                            if _valid(item['name']):
+                                args = item.get('arguments', {})
+                                if isinstance(args, dict): args = json.dumps(args)
+                                tool_calls.append({"name": item["name"], "arguments": args})
+            except (json.JSONDecodeError, ValueError): pass
+
+    # Format 4: self-closing XML in tool_calls
+    if not tool_calls:
+        tc = re.search('<tool_calls>(.*?)</tool_calls>', text, re.DOTALL)
+        if tc:
+            for m in re.finditer('<(\\w+)\\s+([^>]*?)/>>', tc.group(1)):
+                name, attrs = m.group(1), m.group(2)
+                if _valid(name):
+                    args = {}
+                    for am in re.finditer(r"(\w+)=" + chr(34) + '([^"]*)' + chr(34), attrs):
+                        args[am.group(1)] = _clean(am.group(2))
+                    if args:
+                        tool_calls.append({"name": name, "arguments": json.dumps(args)})
+
+    # Format 6: tag with JSON content
+    if not tool_calls:
+        for m in re.finditer('<(\\w+)>\\s*(\\{.*?\\})\\s*</\\1>', text, re.DOTALL):
+            name = m.group(1)
+            try:
+                p = json.loads(m.group(2))
+                if isinstance(p, dict) and _valid(name):
+                    if "name" in p and "arguments" in p:
+                        tool_calls.append(p)
+                    else:
+                        tool_calls.append({"name": name, "arguments": json.dumps(p)})
+            except (json.JSONDecodeError, ValueError): pass
+
+    # Format 8: colon-separated tag
+    if not tool_calls:
+        for m in re.finditer('<(\\w+):(\\w+)>(.*?)</\\1:\\2>', text):
+            tool_name, param_name, value = m.group(1), m.group(2), _clean(m.group(3))
+            if value and _valid(tool_name):
+                tool_calls.append({"name": tool_name, "arguments": json.dumps({param_name: value})})
+
+    # Bare JSON fallback
+    if not tool_calls and available_names:
+        try:
+            p = json.loads(text.strip())
+            if isinstance(p, dict) and "name" in p:
+                if _valid(p['name']):
+                    args = p.get('arguments', {})
+                    if isinstance(args, dict): args = json.dumps(args)
+                    tool_calls.append({"name": p["name"], "arguments": args})
+            elif isinstance(p, list):
+                for item in p:
+                    if isinstance(item, dict) and "name" in item:
+                        if _valid(item['name']):
+                            args = item.get('arguments', {})
+                            if isinstance(args, dict): args = json.dumps(args)
+                            tool_calls.append({"name": item["name"], "arguments": args})
+        except (json.JSONDecodeError, ValueError): pass
+
+    return tool_calls
+
+
 def openai_full(chunk_id: str, created: int, model: str, content: str) -> str:
     return json.dumps({
         "id": chunk_id,
@@ -224,6 +464,7 @@ async def handle_completion(body: dict) -> dict:
     messages = body.get("messages", [])
     stream = body.get("stream", False)
     model = strip_prefix(body.get("model", "deepseek-chat"))
+    tools = body.get("tools")
 
     model_lower = (model or "").lower()
     model_type = "default"
@@ -238,52 +479,139 @@ async def handle_completion(body: dict) -> dict:
     client = create_client()
 
     # ── Session reuse logic ──────────────────────────────────
-    # Hash all messages except the last to identify the conversation prefix.
-    # If we've seen this prefix before, reuse the session and send only the
-    # new user message with parent_message_id.
     last_msg = messages[-1] if messages else {}
     last_content = ""
     c = last_msg.get("content")
-    _log(f"CONTENT type={type(c).__name__} value={str(c)[:500]}")
     if isinstance(c, str):
         last_content = c
     elif isinstance(c, list):
-        # Extract text and check for images
         texts = []
         has_images = False
         for item in c:
-            _log(f"  ITEM type={item.get('type')} keys={list(item.keys())}")
             if item.get("type") == "text":
                 texts.append(item.get("text", ""))
-            elif item.get("type") == "image_url":
+            elif item.get("type") in ("image_url", "image"):
                 has_images = True
-                url = item.get("image_url", {}).get("url", "")
-                _log(f"  IMAGE url_len={len(url)} prefix={url[:50]}")
-            elif item.get("type") == "image":
-                has_images = True
-                _log(f"  IMAGE type=image keys={list(item.keys())}")
         last_content = "\n".join(texts)
-        if has_images:
-            _log(f"WARNING: Image content detected but not supported - only text will be sent")
 
     session_id: str
     prompt: str
     parent_message_id: int | None = None
 
-    if last_msg.get("role") == "user":
+    # ── LOG: Incoming from Hermes ────────────────────────────
+    import json as _json
+    log.debug("=" * 60)
+    log.debug("→ HERMES → PROXY")
+    log.debug(f"  Model: {body.get('model')} | Stream: {stream} | Tools: {len(tools) if tools else 0}")
+    for i, m in enumerate(messages):
+        mc = m.get("content", "")
+        if isinstance(mc, list):
+            mc = "\n".join(item.get("text", "") for item in mc if item.get("type") == "text")
+        log.debug(f"  MSG[{i}] role={m.get('role')}")
+        log.debug(f"    content={str(mc)[:2000]}")
+        # Log extra fields that might carry tool results
+        for key in m:
+            if key not in ("role", "content"):
+                val = m[key]
+                log.debug(f"    {key}={str(val)[:500]}")
+    # Raw JSON of last 2 messages for debugging tool result content
+    for i in range(max(0, len(messages)-2), len(messages)):
+        log.debug(f"  RAW MSG[{i}]: {_json.dumps(messages[i], ensure_ascii=False)[:3000]}")
+
+    # ── LOG: Detection logic ─────────────────────────────────
+    last_tool_call_id = None
+    is_tool_result = False
+
+    if last_msg.get("role") == "tool":
+        last_tool_call_id = last_msg.get("tool_call_id")
+        is_tool_result = True
+        log.debug(f"  DETECT: role=tool → tool_result (tool_call_id={last_tool_call_id})")
+    elif last_msg.get("role") == "user" and len(messages) >= 2:
+        prev = messages[-2]
+        if prev.get("role") == "assistant":
+            prev_text = prev.get("content", "")
+            if isinstance(prev_text, list):
+                prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
+            if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text):
+                is_tool_result = True
+                log.debug(f"  DETECT: prev assistant has tool_call XML → tool_result")
+
+    if last_msg.get("role") in ("user", "tool"):
         pkey = _prefix_key(messages)
-        _log(f"lookup key={pkey} store_keys={list(_session_store.keys())}")
         existing = _session_store.get(pkey)
         if existing:
-            session_id, parent_message_id = existing
-            _log(f"REUSE session {session_id} (parent={parent_message_id})")
+            session_id, parent_message_id, had_tool_call = existing
+            log.debug(f"  SESSION: REUSE {session_id} (parent={parent_message_id} had_tool_call={had_tool_call})")
+            if had_tool_call and not is_tool_result and last_msg.get("role") == "user":
+                is_tool_result = True
+                log.debug(f"  DETECT: had_tool_call=True + role=user → force tool_result")
         else:
             session_id = await client.create_session()
-            _log(f"NEW session {session_id}")
-        prompt = last_content
+            had_tool_call = False
+            log.debug(f"  SESSION: NEW {session_id}")
     else:
         session_id = await client.create_session()
-        prompt = last_content
+        had_tool_call = False
+        log.debug(f"  SESSION: NEW {session_id} (no user/tool role)")
+
+    # ── Build prompt ─────────────────────────────────────────
+    if is_tool_result:
+        lt = chr(60)
+        gt = chr(62)
+        tc_id = last_tool_call_id or "unknown"
+        prompt = f"User: {lt}tool_result id={chr(34)}{tc_id}{chr(34)}{gt}{last_content}{lt}/tool_result{gt}\n\nAssistant:"
+        log.debug(f"  ACTION: wrap tool_result → DeepSeek")
+    elif last_msg.get("role") in ("user", "tool"):
+        sys_parts = []
+        for m in messages:
+            if m.get("role") == "system":
+                sc = m.get("content", "")
+                if isinstance(sc, list):
+                    sc = "\n".join(item.get("text", "") for item in sc if item.get("type") == "text")
+                sys_parts.append("System: " + sc)
+        sys_text = "\n\n".join(sys_parts) if sys_parts else ""
+        if tools:
+            tool_names = [t.get("function", {}).get("name", "unknown") for t in tools]
+            tool_descs = []
+            for t in tools:
+                func = t.get("function", {})
+                name = func.get("name", "unknown")
+                desc = func.get("description", "")
+                params = func.get("parameters", {}).get("properties", {})
+                param_names = list(params.keys())
+                tool_descs.append(f"  - {name}: {desc} (params: {param_names})")
+            tools_text = chr(10).join(tool_descs)
+            names_str = ", ".join(tool_names)
+            lt = chr(60)
+            gt = chr(62)
+            tc_open = lt + "tool_calls" + gt
+            tc_close = lt + "/tool_calls" + gt
+            inv_open = lt + "invoke" + gt
+            inv_close = lt + "/invoke" + gt
+            param_open = lt + "parameter" + gt
+            param_close = lt + "/parameter" + gt
+            tool_ctx = "System: You have access to the following tools. To call a tool, respond with:" + chr(10)
+            tool_ctx += tc_open + chr(10)
+            tool_ctx += "  " + inv_open + chr(32) + "name=" + chr(34) + "TOOL_NAME" + chr(34) + chr(32) + inv_close + chr(10)
+            tool_ctx += "    " + param_open + chr(32) + "name=" + chr(34) + "PARAM_NAME" + chr(34) + chr(32) + param_close + " VALUE " + lt + "/parameter" + gt + chr(10)
+            tool_ctx += "  " + lt + "/invoke" + gt + chr(10)
+            tool_ctx += tc_close + chr(10)
+            tool_ctx += "Available tools: " + names_str + chr(10)
+            tool_ctx += tools_text + chr(10)
+            tool_ctx += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
+        else:
+            tool_ctx = ""
+        prompt = (sys_text + "\n\n" + tool_ctx + "\n\nUser: " + last_content + "\n\nAssistant:").strip()
+        log.debug(f"  ACTION: reuse session → build prompt with system+tools+user")
+    else:
+        prompt = messages_to_prompt(messages, tools)
+        log.debug(f"  ACTION: new session → messages_to_prompt")
+
+    # ── LOG: Outgoing to DeepSeek ────────────────────────────
+    log.debug("← PROXY → DEEPSEEK")
+    log.debug(f"  session={session_id} parent={parent_message_id}")
+    log.debug(f"  PROMPT ({len(prompt)} chars):")
+    log.debug(prompt)
 
     # ── Streaming ────────────────────────────────────────────
     if stream:
@@ -294,6 +622,8 @@ async def handle_completion(body: dict) -> dict:
                 on_chunk(openai_chunk(chunk_id, created, model, "", None))
 
                 thinking_opened = False
+                had_tool_call = False
+                full_text = ""
 
                 def on_thinking_chunk(text: str):
                     nonlocal thinking_opened
@@ -303,11 +633,16 @@ async def handle_completion(body: dict) -> dict:
                     on_chunk(openai_chunk(chunk_id, created, model, "", None, reasoning_content=text))
 
                 def on_text_chunk(text: str):
-                    nonlocal thinking_opened
+                    nonlocal thinking_opened, had_tool_call, full_text
+                    full_text += text
                     if thinking_opened:
                         on_chunk(openai_chunk(chunk_id, created, model, "</think>", None))
                         thinking_opened = False
-                    on_chunk(openai_chunk(chunk_id, created, model, text, None))
+                    if not had_tool_call and re.search(r'<tool_call\s+name=|<invoke\s+name=|<tool_calls>', full_text):
+                        had_tool_call = True
+                    filtered = re.sub(r"</?tool_calls>", "", text)
+                    if filtered:
+                        on_chunk(openai_chunk(chunk_id, created, model, filtered, None))
 
                 result = await client.complete(
                     session_id=session_id,
@@ -323,16 +658,29 @@ async def handle_completion(body: dict) -> dict:
                 if thinking_opened:
                     on_chunk(openai_chunk(chunk_id, created, model, "</think>", None))
 
+                # ── LOG: DeepSeek response
+                log.debug(f"RESPONSE len={len(full_text)}")
+                log.debug(f"CONTENT:\n{full_text}")
+
                 # Store session for reuse — key is hash of user messages including this turn
                 if result and result.get("lastAssistantMessageId"):
                     nkey = _hash_messages(_user_messages(messages))
-                    _session_store[nkey] = (session_id, result["lastAssistantMessageId"])
-                    _log(f"STORE key={nkey} session={session_id}")
+                    pkey = _prefix_key(messages)
+                    _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
+                    _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
+                    log.debug(f"STORE key={nkey} pkey={pkey} had_tool_call={had_tool_call}")
 
                 on_chunk(openai_chunk(chunk_id, created, model, "", "stop"))
-                on_chunk(openai_done())
+
                 on_done()
             except Exception as e:
+                log.debug(f"STREAM ERROR: {e}")
+                # Clean up broken session from store — remove ALL keys pointing to this session
+                if 'session_id' in dir() and session_id:
+                    for k, v in list(_session_store.items()):
+                        if v[0] == session_id:
+                            log.debug(f"Removing broken session {session_id} key={k} from store")
+                            del _session_store[k]
                 on_error(e)
 
         return {"type": "stream", "run": run_stream}
@@ -361,14 +709,23 @@ async def handle_completion(body: dict) -> dict:
     )
 
     # Store session for reuse — key is hash of user messages including this turn
+    had_tool_call = bool(parse_tool_calls(full_text, tools))
     if result and result.get("lastAssistantMessageId"):
         nkey = _hash_messages(_user_messages(messages))
-        _session_store[nkey] = (session_id, result["lastAssistantMessageId"])
-        _log(f"STORE key={nkey} session={session_id}")
+        pkey = _prefix_key(messages)
+        _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
+        _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
+        log.debug(f"STORE key={nkey} pkey={pkey} session={session_id} had_tool_call={had_tool_call}")
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
-    response_body = json.loads(openai_full(chunk_id, created, model, full_text))
+    tool_calls = parse_tool_calls(full_text, tools)
+
+    if tool_calls:
+        response_body = json.loads(openai_tool_calls_response(chunk_id, created, model, tool_calls))
+    else:
+        response_body = json.loads(openai_full(chunk_id, created, model, full_text))
+
     if full_thinking:
         response_body["thinking"] = full_thinking
         response_body["choices"][0]["message"]["reasoning_content"] = full_thinking
@@ -579,11 +936,12 @@ def main():
     global default_thinking, default_search
     args = parse_args()
 
+    setup_logging(DEBUG or args.debug)
+
     default_thinking = not args.no_thinking
     default_search = not args.no_search
 
     if args.proxy:
-        import os
         os.environ["SOCKS5_PROXY"] = args.proxy
 
     if args.manual:

@@ -180,10 +180,13 @@ async def stream_sse(
 
             if debug:
                 import sys
-                print(
-                    f"[event] {event['event'] or 'message'} {event['data'][:500]}",
-                    file=sys.stderr,
-                )
+                try:
+                    print(
+                        f"[event] {event['event'] or 'message'} {event['data'][:500]}",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
 
             import json
 
