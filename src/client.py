@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
+import uuid
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import BASE_URL, COMPLETION_PATH
@@ -22,9 +25,60 @@ class DeepSeekClient:
         self.cookie_header = cookie_header
         self.token = token
         self.debug = debug
+        self._model_settings: dict[str, dict] | None = None
 
     def _build_headers(self) -> dict:
         return base_headers(self.cookie_header, self.token)
+
+    async def fetch_model_settings(self) -> dict[str, dict]:
+        """Fetch model settings from DeepSeek and cache them."""
+        if self._model_settings is not None:
+            return self._model_settings
+
+        did = uuid.uuid4().hex[:32]
+        data = await self._request(
+            f"/api/v0/client/settings?did={did}&scope=model"
+        )
+        configs = (
+            data.get("data", {})
+            .get("biz_data", {})
+            .get("settings", {})
+            .get("model_configs", {})
+            .get("value", [])
+        )
+        self._model_settings = {}
+        for cfg in configs:
+            mt = cfg.get("model_type", "")
+            self._model_settings[mt] = cfg
+
+        return self._model_settings
+
+    async def get_file_limits(self, model_type: str) -> dict | None:
+        """Get file limits for a model type."""
+        settings = await self.fetch_model_settings()
+        cfg = settings.get(model_type, {})
+        return cfg.get("file_feature")
+
+    async def validate_upload(self, filename: str, data: bytes, model_type: str) -> None:
+        """Validate file against model limits before upload."""
+        limits = await self.get_file_limits(model_type)
+        if limits is None:
+            raise RuntimeError(
+                f"Model '{model_type}' does not support file uploads"
+            )
+
+        max_size = limits.get("max_upload_file_size", 0)
+        if max_size and len(data) > max_size:
+            raise RuntimeError(
+                f"File too large: {len(data)} bytes (max {max_size})"
+            )
+
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        allowed = limits.get("support_file_exts", [])
+        if allowed and ext and ext not in allowed:
+            raise RuntimeError(
+                f"File type '.{ext}' not allowed for model '{model_type}'"
+            )
 
     async def _request(self, path: str, method: str = "GET", body: dict | None = None) -> Any:
         client = get_http_client()
@@ -54,6 +108,72 @@ class DeepSeekClient:
             )
 
         return data
+
+    async def upload_file(
+        self,
+        filename: str,
+        data: bytes,
+        model_type: str = "vision",
+        thinking_enabled: bool = True,
+    ) -> str:
+        """Upload a file to DeepSeek and return the file_id."""
+        import aiohttp
+
+        await self.validate_upload(filename, data, model_type)
+
+        url = f"{BASE_URL}/api/v0/file/upload_file"
+        headers = self._build_headers()
+        headers.pop("Content-Type", None)
+
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+        pow_header = await self.create_pow_header("/api/v0/file/upload_file")
+        headers["x-ds-pow-response"] = pow_header
+        headers["x-file-size"] = str(len(data))
+        headers["x-model-type"] = model_type
+        headers["x-thinking-enabled"] = "1" if thinking_enabled else "0"
+        headers["x-client-bundle-id"] = "com.deepseek.chat"
+
+        form = aiohttp.FormData()
+        form.add_field("file", data, filename=filename, content_type=content_type)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=form) as resp:
+                result = await resp.json()
+
+        if result.get("code") != 0:
+            raise RuntimeError(f"File upload failed: {result.get('msg', 'unknown')}")
+
+        file_id = result["data"]["biz_data"]["id"]
+        return file_id
+
+    async def fetch_files(self, file_ids: list[str]) -> list[dict]:
+        """Poll file status until all are SUCCESS."""
+        import asyncio
+
+        client = get_http_client()
+        url = f"{BASE_URL}/api/v0/file/fetch_files"
+        headers = self._build_headers()
+        ids_param = ",".join(file_ids)
+
+        for _ in range(20):
+            resp = await client.get(
+                url, headers=headers, params={"file_ids": ids_param}
+            )
+            data = resp.json()
+            files = (
+                data.get("data", {}).get("biz_data", {}).get("files", [])
+            )
+            all_ready = True
+            for f in files:
+                if f.get("status") not in ("SUCCESS", "FAILED"):
+                    all_ready = False
+                    break
+            if all_ready:
+                return files
+            await asyncio.sleep(0.5)
+
+        return files
 
     async def create_session(self) -> str:
         data = await self._request("/api/v0/chat_session/create", "POST", {})
@@ -101,6 +221,7 @@ class DeepSeekClient:
         parent_message_id: Any = None,
         thinking_enabled: bool = False,
         search_enabled: bool = False,
+        ref_file_ids: list[str] | None = None,
         on_text: Callable[[str], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
     ) -> dict:
@@ -111,7 +232,7 @@ class DeepSeekClient:
             "model_type": model_type,
             "preempt": False,
             "prompt": prompt,
-            "ref_file_ids": [],
+            "ref_file_ids": ref_file_ids or [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
         }
