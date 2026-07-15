@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
+
+log = logging.getLogger("ds")
 
 
 def parse_sse_event(raw: str) -> dict:
@@ -158,12 +161,14 @@ async def stream_sse(
     on_text: Callable[[str], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
     debug: bool = False,
+    req_id: str = "",
 ) -> dict:
     full_text = ""
     full_thinking = ""
     last_message_id = None
     fragments: dict[str, str] = {}
     buffer = ""
+    sse_count = 0
 
     async for line in response.aiter_text():
         buffer += line
@@ -179,14 +184,11 @@ async def stream_sse(
                 continue
 
             if debug:
-                import sys
-                try:
-                    print(
-                        f"[event] {event['event'] or 'message'} {event['data'][:500]}",
-                        file=sys.stderr,
-                    )
-                except Exception:
-                    pass
+                sse_count += 1
+                log.debug(
+                    f"[REQ-{req_id}] SSE#{sse_count} {event['event'] or 'message'}: "
+                    f"{event['data'][:800]}"
+                )
 
             import json
 
@@ -207,4 +209,6 @@ async def stream_sse(
                 if on_thinking:
                     on_thinking(thinking)
 
+    if debug:
+        log.debug(f"[REQ-{req_id}] SSE done — {sse_count} events, {len(full_text)} chars text, {len(full_thinking)} chars thinking")
     return {"lastAssistantMessageId": last_message_id, "text": full_text, "thinking": full_thinking}
