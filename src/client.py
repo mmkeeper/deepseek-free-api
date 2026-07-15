@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import uuid
 from pathlib import Path
@@ -12,6 +13,8 @@ from .headers import base_headers
 from .pow import solve_pow
 from .proxy import get_http_client
 from .sse import stream_sse
+
+log = logging.getLogger("ds")
 
 
 class AuthError(Exception):
@@ -222,6 +225,7 @@ class DeepSeekClient:
         thinking_enabled: bool = False,
         search_enabled: bool = False,
         ref_file_ids: list[str] | None = None,
+        req_id: str = "",
         on_text: Callable[[str], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
     ) -> dict:
@@ -242,11 +246,20 @@ class DeepSeekClient:
         headers = {**self._build_headers(), "X-DS-PoW-Response": pow_header}
         content = json.dumps(body)
 
+        if req_id:
+            log.debug(f"[REQ-{req_id}] DEEPSEEK API POST {COMPLETION_PATH}")
+            log.debug(f"[REQ-{req_id}] Request payload ({len(content)} chars): {content[:3000]}")
+
         async with client.stream("POST", url, headers=headers, content=content) as resp:
             content_type = resp.headers.get("content-type", "")
+            if req_id:
+                log.debug(f"[REQ-{req_id}] DeepSeek HTTP {resp.status_code} content-type={content_type}")
+
             if resp.status_code >= 400 or "text/event-stream" not in content_type:
                 text = await resp.aread()
                 text = text.decode("utf-8", errors="replace")
+                if req_id:
+                    log.debug(f"[REQ-{req_id}] DeepSeek error response: {text[:1000]}")
                 if resp.status_code in (401, 403):
                     raise AuthError("completion")
                 try:
@@ -259,4 +272,4 @@ class DeepSeekClient:
                     pass
                 raise RuntimeError(f"Completion failed: HTTP {resp.status_code}: {text[:1000]}")
 
-            return await stream_sse(resp, on_text=on_text, on_thinking=on_thinking, debug=self.debug)
+            return await stream_sse(resp, on_text=on_text, on_thinking=on_thinking, debug=self.debug, req_id=req_id)
