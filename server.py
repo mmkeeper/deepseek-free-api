@@ -140,6 +140,11 @@ def create_client() -> DeepSeekClient:
 # session_id, parent_message_id, had_tool_call, tool_calls_cache
 _session_store: dict[str, tuple[str, int | None, bool, list | None]] = {}
 
+
+class RetryLaterError(Exception):
+    """Raised when an exact retry arrives while the original request is still pending."""
+    pass
+
 # ─── Logging ────────────────────────────────────────────────
 
 def _log_setup(enabled: bool, log_dir: str | None = None):
@@ -251,6 +256,30 @@ def _pretty_json(text: str) -> str:
         return text
 
 
+def _tool_calls_to_xml(tool_calls: list | None) -> str:
+    """Convert OpenAI tool_calls to DeepSeek XML invoke format."""
+    if not tool_calls:
+        return ""
+    import json as _json
+    lt = chr(60)
+    gt = chr(62)
+    dq = chr(34)
+    lines = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        name = func.get("name", "?")
+        args_str = func.get("arguments", "{}")
+        try:
+            args = _json.loads(args_str) if isinstance(args_str, str) else args_str
+        except (_json.JSONDecodeError, TypeError):
+            args = {}
+        lines.append(f"{lt}invoke name={dq}{name}{dq}{gt}")
+        for k, v in args.items():
+            lines.append(f"  {lt}parameter name={dq}{k}{dq}{gt}{v}{lt}/parameter{gt}")
+        lines.append(f"{lt}/invoke{gt}")
+    return "\n".join(lines)
+
+
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
 
 def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
@@ -286,15 +315,15 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
         tool_header += tools_text + chr(10)
         tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
         tool_header += chr(10)
+    lt = chr(60)
+    gt = chr(62)
+    dq = chr(34)
     for m in messages:
-        role_map = {"assistant": "Assistant", "system": "System"}
-        role = role_map.get(m.get("role"), "User")
-        content = ""
+        role = m.get("role", "")
         c = m.get("content")
         if isinstance(c, str):
             content = c
         elif isinstance(c, list):
-            # Extract text and check for images
             texts = []
             has_images = False
             for item in c:
@@ -305,7 +334,23 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
             content = "\n".join(texts)
             if has_images:
                 log.debug(f"WARNING: Image content in messages_to_prompt - images not supported")
-        parts.append(f"{role}: {content}")
+        else:
+            content = ""
+        content = _pretty_json(content)
+        if role == "tool":
+            tc_id = m.get("tool_call_id", "unknown")
+            parts.append(f"User: {lt}tool_result id={dq}{tc_id}{dq}{gt}\n{content}\n{lt}/tool_result{gt}")
+        elif role == "assistant":
+            tc_xml = _tool_calls_to_xml(m.get("tool_calls"))
+            if content and tc_xml:
+                content = content + "\n" + tc_xml
+            elif tc_xml:
+                content = tc_xml
+            parts.append(f"Assistant: {content}")
+        elif role == "system":
+            parts.append(f"System: {content}")
+        else:
+            parts.append(f"User: {content}")
     return "\n\n".join(parts) + "\n\nAssistant:"
 
 
@@ -677,10 +722,14 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         # Tool call retry check — exact match on ALL user/system messages
         existing = _session_store.get(nkey)
         if existing and not is_tool_result:
-            _, _, had_tool_call, cached_tool_calls = existing if len(existing) == 4 else (*existing, None)
+            sid, pid, had_tool_call, cached_tool_calls = existing if len(existing) == 4 else (*existing, None)
             if had_tool_call and cached_tool_calls:
                 rlog(req_id, f"TOOL CALL REUSE — returning cached tool call (exact message match)")
                 return _build_cached_tool_call_response(chunk_id, created, model, cached_tool_calls, req_id)
+            if pid is None:
+                # Original request still pending — don't send duplicate to DeepSeek
+                rlog(req_id, f"ORIGINAL PENDING — retry for {sid} (wait for stream to complete)")
+                raise RetryLaterError()
 
         # Session continuation check — prefix match
         pkey = _prefix_key(messages)
@@ -692,11 +741,18 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         else:
             session_id = await client.create_session()
             parent_message_id = None
-            rlog(req_id, f"SESSION: NEW {session_id} key={pkey}")
+            # Store immediately to prevent duplicate sessions on Hermes retry
+            _session_store[nkey] = (session_id, parent_message_id, False, None)
+            _session_store[pkey] = (session_id, parent_message_id, False, None)
+            rlog(req_id, f"SESSION: NEW {session_id} key={pkey} nkey={nkey}")
     else:
         session_id = await client.create_session()
         parent_message_id = None
-        rlog(req_id, f"SESSION: NEW {session_id} (no user/tool role)")
+        # Store immediately for no-user/tool requests too
+        _session_store[nkey] = (session_id, parent_message_id, False, None)
+        pkey = _prefix_key(messages)
+        _session_store[pkey] = (session_id, parent_message_id, False, None)
+        rlog(req_id, f"SESSION: NEW {session_id} (no user/tool role) nkey={nkey} pkey={pkey}")
 
     # ── Build prompt ─────────────────────────────────────────
     if is_tool_result:
@@ -710,51 +766,10 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     elif is_continuation:
         prompt = f"User: {last_content}\n\nAssistant:"
         rlog(req_id, f"ACTION: continue session → prompt with user message only")
-    elif last_msg.get("role") in ("user", "tool"):
-        sys_parts = []
-        for m in messages:
-            if m.get("role") == "system":
-                sc = m.get("content", "")
-                if isinstance(sc, list):
-                    sc = "\n".join(item.get("text", "") for item in sc if item.get("type") == "text")
-                sys_parts.append("System: " + sc)
-        sys_text = "\n\n".join(sys_parts) if sys_parts else ""
-        if tools:
-            tool_names = [t.get("function", {}).get("name", "unknown") for t in tools]
-            tool_descs = []
-            for t in tools:
-                func = t.get("function", {})
-                name = func.get("name", "unknown")
-                desc = func.get("description", "")
-                params = func.get("parameters", {}).get("properties", {})
-                param_names = list(params.keys())
-                tool_descs.append(f"  - {name}: {desc} (params: {param_names})")
-            tools_text = chr(10).join(tool_descs)
-            names_str = ", ".join(tool_names)
-            lt = chr(60)
-            gt = chr(62)
-            tc_open = lt + "tool_calls" + gt
-            tc_close = lt + "/tool_calls" + gt
-            inv_open = lt + "invoke" + gt
-            inv_close = lt + "/invoke" + gt
-            param_open = lt + "parameter" + gt
-            param_close = lt + "/parameter" + gt
-            tool_ctx = "System: You have access to the following tools. To call a tool, respond with:" + chr(10)
-            tool_ctx += tc_open + chr(10)
-            tool_ctx += "  " + inv_open + chr(32) + "name=" + chr(34) + "TOOL_NAME" + chr(34) + chr(32) + inv_close + chr(10)
-            tool_ctx += "    " + param_open + chr(32) + "name=" + chr(34) + "PARAM_NAME" + chr(34) + chr(32) + param_close + " VALUE " + lt + "/parameter" + gt + chr(10)
-            tool_ctx += "  " + lt + "/invoke" + gt + chr(10)
-            tool_ctx += tc_close + chr(10)
-            tool_ctx += "Available tools: " + names_str + chr(10)
-            tool_ctx += tools_text + chr(10)
-            tool_ctx += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
-        else:
-            tool_ctx = ""
-        prompt = (sys_text + "\n\n" + tool_ctx + "\n\nUser: " + last_content + "\n\nAssistant:").strip()
-        rlog(req_id, f"ACTION: new session → build prompt with system+tools+user")
     else:
+        # New session — include full conversation history
         prompt = messages_to_prompt(messages, tools)
-        rlog(req_id, f"ACTION: new session → messages_to_prompt")
+        rlog(req_id, f"ACTION: new session ({'tool_result' if is_tool_result else 'full history'}) → messages_to_prompt")
 
     # ── LOG: Outgoing to DeepSeek ────────────────────────────
     rlog(req_id, f"← PROXY → DEEPSEEK  session={session_id} parent={parent_message_id}")
@@ -977,6 +992,8 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         result = await handle_completion(body, req_id)
     except AuthError as e:
         return web.json_response({"error": "auth_required", "message": str(e)}, status=401)
+    except RetryLaterError:
+        return web.json_response({"error": "busy", "message": "Request already in progress"}, status=429)
     except Exception as e:
         return web.json_response({"error": "internal_error", "message": str(e)}, status=500)
 
