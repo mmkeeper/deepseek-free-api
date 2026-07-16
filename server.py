@@ -21,7 +21,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEBUG = False  # Переключи в True для отладки или используй --debug
@@ -137,7 +137,8 @@ def create_client() -> DeepSeekClient:
 
 # ─── Session store (reuse DeepSeek sessions within one server run) ───
 
-_session_store: dict[str, tuple[str, int | None, bool]] = {}
+# session_id, parent_message_id, had_tool_call, tool_calls_cache
+_session_store: dict[str, tuple[str, int | None, bool, list | None]] = {}
 
 # ─── Logging ────────────────────────────────────────────────
 
@@ -147,11 +148,23 @@ def _log_setup(enabled: bool, log_dir: str | None = None):
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if enabled else logging.CRITICAL)
 
-    fmt = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S,%f",
+    class UtcMicroFormatter(logging.Formatter):
+        """Форматтер, поддерживающий %f (микросекунды) и выводящий время в UTC."""
+
+        def formatTime(self, record, datefmt=None):
+            # Создаём datetime в UTC из unix-времени записи
+            dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+            if datefmt:
+                return dt.strftime(datefmt)
+            # Если datefmt не задан — используем стандартное поведение, но с микросекундами
+            return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    # Использование
+    fmt = UtcMicroFormatter(
+        "[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S,%f",  # теперь %f работает
     )
-    fmt.converter = time.gmtime  # UTC timestamps
+
 
     if enabled:
         # File handler — always on when debug is enabled
@@ -195,7 +208,7 @@ def _req_id() -> str:
 
 def rlog(req_id: str, msg: str):
     """Log with request correlation id prefix."""
-    log.debug(f"[REQ-{req_id}] {msg}")
+    log.debug(f"[REQ-{req_id}] {msg}", stacklevel=2)
 
 
 # ─── XML tag stripping — keep content clean from tool markup ─
@@ -226,6 +239,16 @@ def _prefix_key(messages: list[dict]) -> str:
     """Hash of user/system messages in prefix (all except last user turn)."""
     prefix = messages[:-1] if len(messages) >= 1 else []
     return _hash_messages(_user_messages(prefix))
+
+
+def _pretty_json(text: str) -> str:
+    """Pretty-print JSON string if valid, otherwise return as-is."""
+    import json as _json
+    try:
+        obj = _json.loads(text)
+        return _json.dumps(obj, indent=2, ensure_ascii=False)
+    except (_json.JSONDecodeError, TypeError):
+        return text
 
 
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
@@ -317,18 +340,19 @@ def openai_tool_calls_chunk(chunk_id, created, model, tool_calls):
                 "arguments": tc["arguments"]
             }
         })
-    return json.dumps({
+    payload = json.dumps({
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": {"tool_calls": formatted_calls},
+            "delta": {"role": "assistant", "tool_calls": formatted_calls},
             "logprobs": None,
-            "finish_reason": "tool_calls"
+            "finish_reason": None
         }]
-    }) + "\n\n"
+    })
+    return f"data: {payload}\n\n"
 
 
 def openai_tool_calls_response(chunk_id, created, model, tool_calls):
@@ -353,6 +377,7 @@ def openai_tool_calls_response(chunk_id, created, model, tool_calls):
             "index": 0,
             "message": {
                 "role": "assistant",
+                "content": None,
                 "tool_calls": formatted_calls
             },
             "logprobs": None,
@@ -522,6 +547,51 @@ def openai_full(chunk_id: str, created: int, model: str, content: str) -> str:
     })
 
 
+# ─── Cached tool call response builder ────────────────────
+
+def _build_cached_tool_call_response(chunk_id: str, created: int, model: str, tool_calls: list, req_id: str) -> dict:
+    """Build a streaming response that replays cached tool calls without calling DeepSeek."""
+    async def run_stream(on_chunk, on_done, on_error):
+        try:
+            # Assistant role signal
+            payload = json.dumps({
+                "id": chunk_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"},
+                              "logprobs": None, "finish_reason": None}]
+            })
+            on_chunk(f"data: {payload}\n\n")
+            # Tool call chunks
+            for tc in tool_calls:
+                formatted = [{
+                    "index": 0,
+                    "id": f"call_{hash(tc['name']) % 100000:05d}",
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]}
+                }]
+                payload = json.dumps({
+                    "id": chunk_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0,
+                                  "delta": {"role": "assistant", "tool_calls": formatted},
+                                  "logprobs": None, "finish_reason": None}]
+                })
+                on_chunk(f"data: {payload}\n\n")
+            # Final chunk
+            payload = json.dumps({
+                "id": chunk_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {},
+                              "logprobs": None, "finish_reason": "tool_calls"}]
+            })
+            on_chunk(f"data: {payload}\n\n")
+            on_done()
+        except Exception as e:
+            rlog(req_id, f"CACHED STREAM ERROR: {e}")
+            on_error(e)
+    return {"type": "stream", "run": run_stream}
+
+
 # ─── Completion handler ────────────────────────────────────
 
 async def handle_completion(body: dict, req_id: str) -> dict:
@@ -532,7 +602,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
     rlog(req_id, f"=" * 60)
     rlog(req_id, f"→ HERMES → PROXY  model={body.get('model')} stream={stream} tools={len(tools) if tools else 0}")
-    rlog(req_id, f"Raw body: {json.dumps(body, ensure_ascii=False)[:5000]}")
+    rlog(req_id, f"Raw body: {json.dumps(body, ensure_ascii=False)}")
 
     model_lower = (model or "").lower()
     model_type = "default"
@@ -546,8 +616,16 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
     client = create_client()
 
+    chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
+    created = int(time.time())
+
     # ── Session reuse logic ──────────────────────────────────
     last_msg = messages[-1] if messages else {}
+    rlog(req_id, f"MESSAGES ({len(messages)}): roles={[m.get('role') for m in messages]}")
+    rlog(req_id, f"LAST_MSG role={last_msg.get('role')} content_type={type(last_msg.get('content')).__name__} has_tool_calls={bool(last_msg.get('tool_calls'))}")
+    if len(messages) >= 2:
+        prev = messages[-2]
+        rlog(req_id, f"PREV_MSG role={prev.get('role')} content_type={type(prev.get('content')).__name__} has_tool_calls={bool(prev.get('tool_calls'))}")
     last_content = ""
     c = last_msg.get("content")
     if isinstance(c, str):
@@ -577,27 +655,47 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     elif last_msg.get("role") == "user" and len(messages) >= 2:
         prev = messages[-2]
         if prev.get("role") == "assistant":
-            prev_text = prev.get("content", "")
+            prev_text = prev.get("content") or ""
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
             if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text):
                 is_tool_result = True
                 rlog(req_id, f"DETECT: prev assistant has tool_call XML → tool_result")
+            elif prev.get("tool_calls"):
+                is_tool_result = True
+                if not last_tool_call_id:
+                    tc0 = prev["tool_calls"][0]
+                    last_tool_call_id = tc0.get("id")
+                rlog(req_id, f"DETECT: prev assistant has tool_calls field → tool_result")
+
+    # ── Determine if this is a session continuation ──────────
+    nkey = _hash_messages(_user_messages(messages))
+    is_continuation = False
 
     # ── Session lookup / create ──────────────────────────────
     if last_msg.get("role") in ("user", "tool"):
+        # Tool call retry check — exact match on ALL user/system messages
+        existing = _session_store.get(nkey)
+        if existing and not is_tool_result:
+            _, _, had_tool_call, cached_tool_calls = existing if len(existing) == 4 else (*existing, None)
+            if had_tool_call and cached_tool_calls:
+                rlog(req_id, f"TOOL CALL REUSE — returning cached tool call (exact message match)")
+                return _build_cached_tool_call_response(chunk_id, created, model, cached_tool_calls, req_id)
+
+        # Session continuation check — prefix match
         pkey = _prefix_key(messages)
         existing = _session_store.get(pkey)
         if existing:
-            session_id, parent_message_id, had_tool_call = existing
-            rlog(req_id, f"SESSION: REUSE {session_id} (parent={parent_message_id} had_tool_call={had_tool_call})")
+            session_id, parent_message_id, _, _ = existing if len(existing) == 4 else (*existing, None)
+            is_continuation = True
+            rlog(req_id, f"SESSION: CONTINUE {session_id} (parent={parent_message_id})")
         else:
             session_id = await client.create_session()
-            had_tool_call = False
+            parent_message_id = None
             rlog(req_id, f"SESSION: NEW {session_id} key={pkey}")
     else:
         session_id = await client.create_session()
-        had_tool_call = False
+        parent_message_id = None
         rlog(req_id, f"SESSION: NEW {session_id} (no user/tool role)")
 
     # ── Build prompt ─────────────────────────────────────────
@@ -605,9 +703,13 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         lt = chr(60)
         gt = chr(62)
         tc_id = last_tool_call_id or "unknown"
-        prompt = f"User: {lt}tool_result id={chr(34)}{tc_id}{chr(34)}{gt}{last_content}{lt}/tool_result{gt}\n\nAssistant:"
+        content = _pretty_json(last_content)
+        prompt = f"User: {lt}tool_result id={chr(34)}{tc_id}{chr(34)}{gt}\n{content}\n{lt}/tool_result{gt}\n\nAssistant:"
         rlog(req_id, f"ACTION: wrap tool_result → DeepSeek")
-        rlog(req_id, f"Tool result content ({len(last_content)} chars): {last_content[:500]}")
+        rlog(req_id, f"Tool result content ({len(content)} chars): {content[:500]}")
+    elif is_continuation:
+        prompt = f"User: {last_content}\n\nAssistant:"
+        rlog(req_id, f"ACTION: continue session → prompt with user message only")
     elif last_msg.get("role") in ("user", "tool"):
         sys_parts = []
         for m in messages:
@@ -649,7 +751,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         else:
             tool_ctx = ""
         prompt = (sys_text + "\n\n" + tool_ctx + "\n\nUser: " + last_content + "\n\nAssistant:").strip()
-        rlog(req_id, f"ACTION: reuse session → build prompt with system+tools+user")
+        rlog(req_id, f"ACTION: new session → build prompt with system+tools+user")
     else:
         prompt = messages_to_prompt(messages, tools)
         rlog(req_id, f"ACTION: new session → messages_to_prompt")
@@ -665,7 +767,13 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             try:
                 chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
                 created = int(time.time())
-                on_chunk(openai_chunk(chunk_id, created, model, "", None))
+                payload = json.dumps({
+                    "id": chunk_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"},
+                                  "logprobs": None, "finish_reason": None}]
+                })
+                on_chunk(f"data: {payload}\n\n")
 
                 thinking_opened = False
                 full_text = ""
@@ -722,34 +830,41 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 # ── LOG: DeepSeek raw response
                 rlog(req_id, f"DEEPSEEK RESPONSE ({len(full_text)} chars):\n{full_text}")
 
-                # ── At the end: decide whether we have tool calls ──
-                had_tool_call = False
-                if in_tool_call:
-                    # Parse tool calls from full_text (includes any lead-in text)
-                    tool_calls = parse_tool_calls(full_text, tools)
-                    if tool_calls:
-                        had_tool_call = True
-                        rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
-                        # Send tool_calls chunk (replaces the buffered XML)
-                        on_chunk(openai_tool_calls_chunk(chunk_id, created, model, tool_calls))
-                    else:
-                        # Fallback: flush buffered tool text as filtered content
-                        rlog(req_id, f"TOOL CALL PARSE FAILED — sending as filtered text")
-                        remaining = _strip_tool_tags(tool_text_buf)
-                        if remaining:
-                            on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
+                # ── At the end: always parse full_text for tool calls ──
+                tool_calls = parse_tool_calls(full_text, tools)
+                had_tool_call = bool(tool_calls)
+
+                if had_tool_call:
+                    rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
+                    # If mid-stream didn't fire, send text before first tool call now
+                    if not in_tool_call:
+                        m = re.search(r'<(?:invoke|tool_call|tool_calls)\s', full_text)
+                        if m:
+                            before = _strip_tool_tags(full_text[:m.start()])
+                            if before:
+                                on_chunk(openai_chunk(chunk_id, created, model, before, None))
+                    # Each tool call as individual chunk for compatibility
+                    for tc in tool_calls:
+                        on_chunk(openai_tool_calls_chunk(chunk_id, created, model, [tc]))
+                elif in_tool_call:
+                    # Mid-stream detected tool call but parsing failed
+                    rlog(req_id, f"TOOL CALL PARSE FAILED — sending as filtered text")
+                    remaining = _strip_tool_tags(tool_text_buf)
+                    if remaining:
+                        on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
                 else:
-                    # No tool calls at all — flush remaining text_buf
+                    # No tool calls — flush all buffered text
                     remaining = _strip_tool_tags(text_buf)
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
 
                 # ── Store session for reuse ──
+                cached_tc = tool_calls if had_tool_call else None
                 if result and result.get("lastAssistantMessageId"):
                     nkey = _hash_messages(_user_messages(messages))
                     pkey = _prefix_key(messages)
-                    _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
-                    _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
+                    _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
+                    _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
                     rlog(req_id, f"STORE session key={nkey} pkey={pkey} had_tool_call={had_tool_call}")
 
                 finish_reason = "tool_calls" if had_tool_call else "stop"
@@ -796,17 +911,18 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     rlog(req_id, f"DEEPSEEK RESPONSE ({len(full_text)} chars):\n{full_text}")
 
     # Store session for reuse — key is hash of user messages including this turn
-    had_tool_call = bool(parse_tool_calls(full_text, tools))
+    tool_calls = parse_tool_calls(full_text, tools)
+    had_tool_call = bool(tool_calls)
     if result and result.get("lastAssistantMessageId"):
         nkey = _hash_messages(_user_messages(messages))
         pkey = _prefix_key(messages)
-        _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
-        _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call)
+        cached_tc = tool_calls if had_tool_call else None
+        _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
+        _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
         rlog(req_id, f"STORE session key={nkey} pkey={pkey} had_tool_call={had_tool_call}")
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
-    tool_calls = parse_tool_calls(full_text, tools)
 
     if tool_calls:
         rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
@@ -911,7 +1027,10 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
 
     def on_error(error: Exception):
         nonlocal closed
-        print(f"[stream] {error}", file=sys.stderr)
+        try:
+            print(f"[stream] {error}", file=sys.stderr)
+        except OSError:
+            pass
         if not closed:
             err_data = json.dumps({"error": str(error)})
             write_queue.put_nowait(f"data: {err_data}\n\n".encode("utf-8"))
@@ -979,27 +1098,27 @@ async def run_server(port: int, host: str):
 ║══════════════════════════════════════════════════║
 ║  Port:    {str(port):<39}║
 ║  Host:    {host:<39}║
-║  {proxy_line:<47}║
+║  {proxy_line:<48}║
 ║══════════════════════════════════════════════════║
-║  POST http://localhost:{port}/v1/chat/completions    ║
-║  GET  http://localhost:{port}/v1/models               ║
-║  GET  http://localhost:{port}/health                   ║
+║  POST http://localhost:{port}/v1/chat/completions ║
+║  GET  http://localhost:{port}/v1/models           ║
+║  GET  http://localhost:{port}/health              ║
 ╚══════════════════════════════════════════════════╝
         """)
     except UnicodeEncodeError:
         safe_line = proxy_line.encode("ascii", "replace").decode()
         print(f"""
-+----------------------------------------------+
-|     DeepSeek Free -> OpenAI Proxy            |
-+----------------------------------------------+
++--------------------------------------------------+
+|     DeepSeek Free -> OpenAI Proxy                |
++--------------------------------------------------+
 |  Port:    {str(port):<39}|
 |  Host:    {host:<39}|
-|  {safe_line:<47}|
-+----------------------------------------------+
-|  POST http://localhost:{port}/v1/chat/completions  |
-|  GET  http://localhost:{port}/v1/models             |
-|  GET  http://localhost:{port}/health                 |
-+----------------------------------------------+
+|  {safe_line:<48}|
++--------------------------------------------------+
+|  POST http://localhost:{port}/v1/chat/completions |
+|  GET  http://localhost:{port}/v1/models           |
+|  GET  http://localhost:{port}/health              |
++--------------------------------------------------+
         """)
 
     try:
