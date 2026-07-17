@@ -6,6 +6,13 @@ from typing import Any, Callable
 log = logging.getLogger("ds")
 
 
+class DeepSeekError(Exception):
+    def __init__(self, message: str, finish_reason: str | None = None):
+        self.message = message
+        self.finish_reason = finish_reason
+        super().__init__(message)
+
+
 def parse_sse_event(raw: str) -> dict:
     event = {"event": "", "data": ""}
     for line in raw.split("\n"):
@@ -196,6 +203,11 @@ async def stream_sse(
                 parsed = json.loads(event["data"])
             except (json.JSONDecodeError, ValueError):
                 continue
+
+            if isinstance(parsed, dict) and parsed.get("type") == "error":
+                err_msg = parsed.get("content", "Unknown DeepSeek error")
+                finish_reason = parsed.get("finish_reason")
+                raise DeepSeekError(err_msg, finish_reason=finish_reason)
 
             text, thinking, msg_id = extract_delta_text(parsed, fragments, event["event"])
             if msg_id is not None:
