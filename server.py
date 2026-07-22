@@ -277,10 +277,17 @@ def _prefix_key(messages: list[dict]) -> str:
 
     Tool result messages (both role=tool and user role preceded by assistant
     with tool_calls) are excluded so the key stays stable across retries.
+
+    Returns empty string if there are fewer than 2 user/system messages in
+    the prefix, preventing different conversations with the same system prompt
+    from colliding on the same DeepSeek session.
     """
     prefix = messages[:-1] if len(messages) >= 1 else []
     stable = _strip_tool_results(prefix)
-    return _hash_messages(_user_messages(stable))
+    umsgs = _user_messages(stable)
+    if len(umsgs) < 2:
+        return ""
+    return _hash_messages(umsgs)
 
 
 def _truncate_content(text: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
@@ -820,8 +827,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         else:
             # Session continuation check — prefix match
             pkey = _prefix_key(messages)
-            rlog(req_id, f"COMPARE pkey={pkey} (prefix of {len(messages)-1} user/system msgs)")
-            existing = _session_store.get(pkey)
+            rlog(req_id, f"COMPARE pkey={pkey or '(empty)'} (prefix of {len(messages)-1} user/system msgs)")
+            existing = _session_store.get(pkey) if pkey else None
             if existing:
                 session_id, parent_message_id, _, _ = existing if len(existing) == 4 else (*existing, None)
                 is_continuation = True
@@ -830,12 +837,13 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 session_id = await client.create_session()
                 parent_message_id = None
                 _session_store[nkey] = (session_id, parent_message_id, False, None)
-                _session_store[pkey] = (session_id, parent_message_id, False, None)
-                rlog(req_id, f"STORE MISS → SESSION: NEW {session_id} nkey={nkey} pkey={pkey}")
+                if pkey:
+                    _session_store[pkey] = (session_id, parent_message_id, False, None)
+                rlog(req_id, f"STORE MISS → SESSION: NEW {session_id} nkey={nkey} pkey={pkey or '(empty)'}")
     else:
         pkey = _prefix_key(messages)
-        rlog(req_id, f"COMPARE pkey={pkey} (prefix of {len(messages)-1} user/system msgs, last=assistant)")
-        existing = _session_store.get(pkey)
+        rlog(req_id, f"COMPARE pkey={pkey or '(empty)'} (prefix of {len(messages)-1} user/system msgs, last=assistant)")
+        existing = _session_store.get(pkey) if pkey else None
         if existing:
             session_id, parent_message_id, _, _ = existing if len(existing) == 4 else (*existing, None)
             is_continuation = True
@@ -844,8 +852,9 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             session_id = await client.create_session()
             parent_message_id = None
             _session_store[nkey] = (session_id, parent_message_id, False, None)
-            _session_store[pkey] = (session_id, parent_message_id, False, None)
-            rlog(req_id, f"SESSION: NEW {session_id} (no user/tool role) nkey={nkey} pkey={pkey}")
+            if pkey:
+                _session_store[pkey] = (session_id, parent_message_id, False, None)
+            rlog(req_id, f"SESSION: NEW {session_id} (no user/tool role) nkey={nkey} pkey={pkey or '(empty)'}")
 
     # ── Build prompt ─────────────────────────────────────────
     if is_tool_result:
@@ -994,8 +1003,9 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     nkey = _hash_messages(_user_messages(messages))
                     pkey = _prefix_key(messages)
                     _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
-                    _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
-                    rlog(req_id, f"STORE session key={nkey} pkey={pkey} had_tool_call={had_tool_call}")
+                    if pkey:
+                        _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
+                    rlog(req_id, f"STORE session key={nkey} pkey={pkey or '(empty)'} had_tool_call={had_tool_call}")
 
                 finish_reason = "tool_calls" if had_tool_call else "stop"
                 chunk_str = openai_chunk(chunk_id, created, model, "", finish_reason)
@@ -1057,8 +1067,9 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         pkey = _prefix_key(messages)
         cached_tc = tool_calls if had_tool_call else None
         _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
-        _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
-        rlog(req_id, f"STORE session key={nkey} pkey={pkey} had_tool_call={had_tool_call}")
+        if pkey:
+            _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
+        rlog(req_id, f"STORE session key={nkey} pkey={pkey or '(empty)'} had_tool_call={had_tool_call}")
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
