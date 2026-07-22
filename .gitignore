@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+*.log.bak
+logs/server.err
+logs/server.out
 .env
 venv/
 .venv/

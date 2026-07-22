@@ -723,7 +723,18 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     elif "vision" in model_lower:
         model_type = "vision"
 
-    thinking_enabled = body.get("thinking_enabled", default_thinking)
+    # reasoning_effort от Hermes: none/minimal/low/medium/high/xhigh/max/ultra/show/hide
+    # Перебивается флагом --no-thinking
+    if not default_thinking:
+        thinking_enabled = False
+    else:
+        reasoning_effort = body.get("reasoning_effort", "")
+        if reasoning_effort in ("high", "xhigh", "max", "ultra", "show"):
+            thinking_enabled = True
+        elif reasoning_effort in ("", "none", "minimal", "low", "medium", "hide"):
+            thinking_enabled = False
+        else:
+            thinking_enabled = body.get("thinking_enabled", default_thinking)
     search_enabled = body.get("search_enabled", default_search)
 
     client = create_client()
