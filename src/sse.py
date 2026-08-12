@@ -48,12 +48,14 @@ def extract_delta_text(value: Any, cache: dict, event_name: str = "") -> tuple[s
         if not isinstance(node, dict):
             return
 
+        # Priority: response_message_id (the assistant message being generated,
+        # which is what stop_stream targets) → assistant id → plain message_id.
         if isinstance(node.get("response_message_id"), int):
             message_id = node["response_message_id"]
-        if isinstance(node.get("message_id"), int):
-            message_id = node["message_id"]
         if isinstance(node.get("id"), int) and node.get("role") == "ASSISTANT":
             message_id = node["id"]
+        if message_id is None and isinstance(node.get("message_id"), int):
+            message_id = node["message_id"]
 
         # Content update without "o" marker: {"p": "response/fragments/-1/content", "v": "..."}
         if (
@@ -167,6 +169,7 @@ async def stream_sse(
     response,
     on_text: Callable[[str], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
+    on_message_id: Callable[[int], None] | None = None,
     debug: bool = False,
     req_id: str = "",
 ) -> dict:
@@ -212,6 +215,8 @@ async def stream_sse(
             text, thinking, msg_id = extract_delta_text(parsed, fragments, event["event"])
             if msg_id is not None:
                 last_message_id = msg_id
+                if on_message_id:
+                    on_message_id(msg_id)
             if text:
                 full_text += text
                 if on_text:

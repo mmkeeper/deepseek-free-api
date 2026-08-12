@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import BASE_URL, COMPLETION_PATH
+from .config import BASE_URL, COMPLETION_PATH, STOP_STREAM_PATH
 from .headers import base_headers
 from .pow import solve_pow
 from .proxy import get_http_client
@@ -216,6 +216,23 @@ class DeepSeekClient:
         }
         return base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
+    async def stop_stream(self, session_id: str, message_id: int | None = None) -> bool:
+        """Ask DeepSeek to stop the currently generating response in a session.
+
+        The web client calls POST /api/v0/chat/stop_stream when the user hits
+        stop — the server stops generation and does NOT commit the partial
+        message, keeping the session parent pointer at the previous message.
+        """
+        body: dict = {"chat_session_id": session_id}
+        if message_id is not None:
+            body["message_id"] = message_id
+        try:
+            data = await self._request(STOP_STREAM_PATH, "POST", body)
+            return data.get("code") == 0
+        except Exception as e:
+            log.debug(f"stop_stream failed: {e}")
+            return False
+
     async def complete(
         self,
         session_id: str,
@@ -228,6 +245,7 @@ class DeepSeekClient:
         req_id: str = "",
         on_text: Callable[[str], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
+        on_message_id: Callable[[int], None] | None = None,
     ) -> dict:
         pow_header = await self.create_pow_header(COMPLETION_PATH)
         body = {
@@ -272,4 +290,6 @@ class DeepSeekClient:
                     pass
                 raise RuntimeError(f"Completion failed: HTTP {resp.status_code}: {text[:1000]}")
 
-            return await stream_sse(resp, on_text=on_text, on_thinking=on_thinking, debug=self.debug, req_id=req_id)
+            return await stream_sse(resp, on_text=on_text, on_thinking=on_thinking,
+                                    on_message_id=on_message_id, debug=self.debug,
+                                    req_id=req_id)

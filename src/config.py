@@ -4,6 +4,7 @@ from pathlib import Path
 BASE_URL = "https://chat.deepseek.com"
 APP_VERSION = "2.0.0"
 COMPLETION_PATH = "/api/v0/chat/completion"
+STOP_STREAM_PATH = "/api/v0/chat/stop_stream"
 DEEPSEEK_SHA3_WASM = (
     "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
 )

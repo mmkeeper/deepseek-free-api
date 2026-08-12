@@ -906,6 +906,10 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
     # ── Streaming ────────────────────────────────────────────
     if stream:
+        # Shared with handle_chat: current DeepSeek message_id so the proxy can
+        # call stop_stream when the client disconnects mid-generation.
+        stream_state = {"message_id": None}
+
         async def run_stream(on_chunk, on_done, on_error):
             session_cleaned = False
             try:
@@ -958,6 +962,9 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     else:
                         text_buf += text
 
+                def on_message_id_chunk(mid: int):
+                    stream_state["message_id"] = mid
+
                 result = await client.complete(
                     session_id=session_id,
                     prompt=prompt,
@@ -968,6 +975,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     req_id=req_id,
                     on_text=on_text_chunk,
                     on_thinking=on_thinking_chunk,
+                    on_message_id=on_message_id_chunk,
                 )
 
                 if thinking_opened:
@@ -1029,6 +1037,15 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 rlog(req_id, f"→ PROXY → HERMES  think_content:\n{think_text[:2000]}")
                 rlog(req_id, f"→ PROXY → HERMES  tool_calls_content: {tc_log[:2000]}")
                 on_done()
+            except asyncio.CancelledError:
+                rlog(req_id, "STREAM CANCELLED — client disconnected")
+                if not session_cleaned:
+                    session_cleaned = True
+                    for k, v in list(_session_store.items()):
+                        if v[0] == session_id and v[1] is None:
+                            rlog(req_id, f"Removing pending session {session_id} key={k} from store")
+                            del _session_store[k]
+                raise
             except DeepSeekError as e:
                 rlog(req_id, f"DEEPSEEK ERROR: {e} finish_reason={e.finish_reason}")
                 on_error(e)
@@ -1042,7 +1059,9 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                             del _session_store[k]
                 on_error(e)
 
-        return {"type": "stream", "run": run_stream}
+        return {"type": "stream", "run": run_stream,
+                "client": client, "session_id": session_id,
+                "state": stream_state}
 
     # ── Non-streaming ────────────────────────────────────────
     full_text = ""
@@ -1179,8 +1198,6 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
             except Exception:
                 pass
 
-    writer_task = asyncio.create_task(writer())
-
     def on_chunk(chunk: str):
         if not closed:
             if '"finish_reason"' in chunk or '"tool_calls"' in chunk:
@@ -1201,9 +1218,27 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
             write_queue.put_nowait(f"data: {err_data}\n\n".encode("utf-8"))
             write_queue.put_nowait(None)
 
-    asyncio.create_task(result["run"](on_chunk, on_done, on_error))
+    writer_task = asyncio.create_task(writer())
+    stream_task = asyncio.create_task(result["run"](on_chunk, on_done, on_error))
 
     await writer_task
+
+    if closed:
+        # Client disconnected mid-stream — stop upstream generation so DeepSeek
+        # does not commit a response the client never received.
+        stop_client = result.get("client")
+        if stop_client:
+            session_id = result.get("session_id")
+            message_id = (result.get("state") or {}).get("message_id")
+            rlog(req_id, f"CLIENT DISCONNECT — stop_stream session={session_id} message_id={message_id}")
+            await stop_client.stop_stream(session_id, message_id)
+        if not stream_task.done():
+            stream_task.cancel()
+        try:
+            await stream_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     return response
 
 
