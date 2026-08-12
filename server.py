@@ -290,6 +290,35 @@ def _prefix_key(messages: list[dict]) -> str:
     return _hash_messages(umsgs)
 
 
+# ─── Turn frames (rollback / regenerate / continuation) ─────
+# per session an ordered list of committed turns, used to resolve the
+# DeepSeek parent for continue, regenerate and edited rollback requests:
+#   {"key": nkey of the user/system messages incl. this turn,
+#    "parent_id": response id of the previous frame (DeepSeek parent used),
+#    "response_msg_id": DeepSeek id of this turn's assistant message,
+#    "user_text": last user content (debug only)}
+# Frames are append-only; _frame_for_key returns the LATEST frame for a key,
+# so continuing after a regenerated reply points to the newest response.
+_session_frames: dict[str, list[dict]] = {}
+
+
+def _frame_for_key(session_id: str, key: str) -> dict | None:
+    for f in reversed(_session_frames.get(session_id, [])):
+        if f.get("key") == key:
+            return f
+    return None
+
+
+def _record_turn(session_id: str, key: str, parent_id: int | None,
+                 response_msg_id: int, user_text: str):
+    _session_frames.setdefault(session_id, []).append({
+        "key": key,
+        "parent_id": parent_id,
+        "response_msg_id": response_msg_id,
+        "user_text": user_text,
+    })
+
+
 def _truncate_content(text: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
     if len(text) <= max_chars:
         return text
@@ -812,6 +841,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     umsgs = _user_messages(messages)
     nkey = _hash_messages(umsgs)
     is_continuation = False
+    is_rollback = False
 
     # ── Session lookup / create ──────────────────────────────
     if last_msg.get("role") in ("user", "tool"):
@@ -835,15 +865,33 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         if existing and is_tool_result:
             session_id, parent_message_id, _, _ = existing if len(existing) == 4 else (*existing, None)
             rlog(req_id, f"TOOL RESULT — continue session {session_id} parent={parent_message_id}")
-        else:
+        elif existing:
+            # Identical user/system messages already answered → regenerate from the
+            # parent the original turn used (frames keep it, unlike _session_store).
+            frame_r = _frame_for_key(existing[0], nkey)
+            if frame_r is not None and frame_r.get("parent_id") is not None:
+                session_id = existing[0]
+                parent_message_id = frame_r["parent_id"]
+                is_rollback = True
+                rlog(req_id, f"REGENERATE nkey={nkey} → session {session_id} parent={parent_message_id}")
+            else:
+                # First-turn regenerate (no historical parent) → fresh session.
+                existing = None
+        if not existing:
             # Session continuation check — prefix match
             pkey = _prefix_key(messages)
             rlog(req_id, f"COMPARE pkey={pkey or '(empty)'} (prefix of {len(messages)-1} user/system msgs)")
             existing = _session_store.get(pkey) if pkey else None
             if existing:
-                session_id, parent_message_id, _, _ = existing if len(existing) == 4 else (*existing, None)
+                session_id = existing[0]
+                # Parent = response of the frame matching this prefix. Frames are
+                # append-only, so a rollback/truncation keeps the OLD continuation
+                # point instead of following the clobbered latest parent.
+                frame_p = _frame_for_key(session_id, pkey)
+                parent_message_id = frame_p["response_msg_id"] if frame_p else existing[1]
                 is_continuation = True
-                rlog(req_id, f"STORE HIT pkey={pkey} → CONTINUE {session_id} parent={parent_message_id}")
+                rlog(req_id, f"CONTINUE via pkey={pkey} → session {session_id} parent={parent_message_id}"
+                     f"{'' if frame_p else ' (fallback to store)'}")
             else:
                 session_id = await client.create_session()
                 parent_message_id = None
@@ -856,9 +904,12 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         rlog(req_id, f"COMPARE pkey={pkey or '(empty)'} (prefix of {len(messages)-1} user/system msgs, last=assistant)")
         existing = _session_store.get(pkey) if pkey else None
         if existing:
-            session_id, parent_message_id, _, _ = existing if len(existing) == 4 else (*existing, None)
+            session_id = existing[0]
+            frame_p = _frame_for_key(session_id, pkey)
+            parent_message_id = frame_p["response_msg_id"] if frame_p else existing[1]
             is_continuation = True
-            rlog(req_id, f"STORE HIT pkey={pkey} → CONTINUE {session_id} parent={parent_message_id}")
+            rlog(req_id, f"CONTINUE via pkey={pkey} → session {session_id} parent={parent_message_id}"
+                 f"{'' if frame_p else ' (fallback to store)'}")
         else:
             session_id = await client.create_session()
             parent_message_id = None
@@ -892,6 +943,9 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             display_len = len(content)
             rlog(req_id, f"ACTION: wrap tool_result (fallback) → DeepSeek id={tc_id}")
             rlog(req_id, f"Tool result content ({orig_len} chars → {display_len} chars{' — TRUNCATED' if display_len < orig_len else ''}): {content[:500]}")
+    elif is_rollback:
+        prompt = last_content
+        rlog(req_id, f"ACTION: regenerate (rollback) → raw message (no User: prefix)")
     elif is_continuation:
         prompt = last_content
         rlog(req_id, f"ACTION: continue session → raw message (no User: prefix)")
@@ -1024,6 +1078,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
                     if pkey:
                         _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
+                    _record_turn(session_id, nkey, parent_message_id,
+                                 result["lastAssistantMessageId"], last_content)
                     rlog(req_id, f"STORE session key={nkey} pkey={pkey or '(empty)'} had_tool_call={had_tool_call}")
 
                 finish_reason = "tool_calls" if had_tool_call else "stop"
@@ -1099,6 +1155,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         _session_store[nkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
         if pkey:
             _session_store[pkey] = (session_id, result["lastAssistantMessageId"], had_tool_call, cached_tc)
+        _record_turn(session_id, nkey, parent_message_id,
+                     result["lastAssistantMessageId"], last_content)
         rlog(req_id, f"STORE session key={nkey} pkey={pkey or '(empty)'} had_tool_call={had_tool_call}")
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
