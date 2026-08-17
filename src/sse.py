@@ -5,6 +5,12 @@ from typing import Any, Callable
 
 log = logging.getLogger("ds")
 
+# DeepSeek wraps tool-call tags with a fullwidth-bars marker "||DSML||"
+# (U+FF5C x2 + "DSML" + U+FF5C x2). It is a service delimiter that must not
+# reach the client. It never arrives split across tokens, so it can be
+# stripped on the fly as events are received.
+_DSML_MARKER = "\uff5c\uff5cDSML\uff5c\uff5c"
+
 
 class DeepSeekError(Exception):
     def __init__(self, message: str, finish_reason: str | None = None):
@@ -218,10 +224,12 @@ async def stream_sse(
                 if on_message_id:
                     on_message_id(msg_id)
             if text:
+                text = text.replace(_DSML_MARKER, "")
                 full_text += text
                 if on_text:
                     on_text(text)
             if thinking:
+                thinking = thinking.replace(_DSML_MARKER, "")
                 full_thinking += thinking
                 if on_thinking:
                     on_thinking(thinking)

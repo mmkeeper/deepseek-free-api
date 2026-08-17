@@ -118,6 +118,52 @@ def test_delta_tracking_response():
     assert t == "lo", f"got '{t}'"
 
 
+def test_dsml_marker_filtered_from_text():
+    """The ||DSML|| delimiter is stripped before reaching the client."""
+    import asyncio
+    from src.sse import stream_sse
+
+    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+
+    class FakeResp:
+        async def aiter_text(self):
+            for chunk in [
+                f'data: {{"v": "Hello"}}\n\n',
+                f'data: {{"v": "<{marker}invoke name="}}\n\n',
+                f'data: {{"v": "web_extract">"}}\n\n',
+                f'data: {{"v": "</{marker}invoke>"}}\n\n',
+                f'data: {{"v": "<{marker}tool_calls>"}}\n\n',
+            ]:
+                yield chunk
+
+    out_text, out_think = [], []
+    asyncio.run(stream_sse(FakeResp(), on_text=out_text.append, on_thinking=out_think.append))
+    joined = "".join(out_text)
+    assert marker not in joined, f"DSML marker leaked: {joined!r}"
+    assert "<invoke" in joined, f"tool tag lost: {joined!r}"
+
+
+def test_dsml_marker_filtered_from_thinking():
+    """The ||DSML|| delimiter is stripped from thinking too."""
+    import asyncio
+    from src.sse import stream_sse
+
+    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+
+    class FakeResp:
+        async def aiter_text(self):
+            for chunk in [
+                f'data: {{"v": "{marker}reason{marker}"}}\n\n',
+                f'data: {{"v": "ing"}}\n\n',
+            ]:
+                yield chunk
+
+    out_text, out_think = [], []
+    asyncio.run(stream_sse(FakeResp(), on_text=out_text.append, on_thinking=out_think.append))
+    joined = "".join(out_think)
+    assert marker not in joined, f"DSML marker leaked in thinking: {joined!r}"
+
+
 if __name__ == "__main__":
     tests = [
         test_think_snapshot_delta,
@@ -128,6 +174,8 @@ if __name__ == "__main__":
         test_new_fragment_appended,
         test_full_sequence,
         test_delta_tracking_response,
+        test_dsml_marker_filtered_from_text,
+        test_dsml_marker_filtered_from_thinking,
     ]
     for t in tests:
         try:
