@@ -330,7 +330,7 @@ class DeepSeekClient:
         emitted — replaying an already-partially-streamed response would
         duplicate output for the client.
         """
-        emitted = {"text": False, "thinking": False, "message_id": False}
+        emitted = {"text": False, "thinking": False}
 
         def _wrap_text(fn):
             if fn is None:
@@ -350,14 +350,6 @@ class DeepSeekClient:
                 fn(t)
             return wrapped
 
-        def _wrap_message_id(fn):
-            if fn is None:
-                return None
-            def wrapped(m):
-                emitted["message_id"] = True
-                fn(m)
-            return wrapped
-
         for attempt in range(len(_RATE_LIMIT_BACKOFF) + 1):
             try:
                 return await self._complete_once(
@@ -371,7 +363,7 @@ class DeepSeekClient:
                     req_id=req_id,
                     on_text=_wrap_text(on_text),
                     on_thinking=_wrap_thinking(on_thinking),
-                    on_message_id=_wrap_message_id(on_message_id),
+                    on_message_id=on_message_id,
                 )
             except DeepSeekError as e:
                 if e.finish_reason not in _RETRYABLE_FINISH_REASONS:
@@ -379,8 +371,8 @@ class DeepSeekClient:
                 if any(emitted.values()):
                     log.warning(
                         f"[REQ-{req_id}] {e.finish_reason} after partial output "
-                        f"(text={emitted['text']} thinking={emitted['thinking']} "
-                        f"msg={emitted['message_id']}) — not retrying, propagating: {e.message}"
+                        f"(text={emitted['text']} thinking={emitted['thinking']}) "
+                        f"— not retrying, propagating: {e.message}"
                     )
                     raise
                 if attempt >= len(_RATE_LIMIT_BACKOFF):

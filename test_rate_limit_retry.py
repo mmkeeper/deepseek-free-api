@@ -100,6 +100,32 @@ def test_no_retry_after_partial_output():
     assert sleeps == []
 
 
+def test_retries_after_message_id_only():
+    """A message_id arriving before the error must NOT block the retry.
+
+    DeepSeek sends response_message_id in the very first 'ready' event,
+    before any content — so it is not evidence of partial client output.
+    """
+    sleeps = []
+    attempts = []
+
+    async def fake_once(on_text=None, on_thinking=None, on_message_id=None, **kwargs):
+        attempts.append(1)
+        if on_message_id:
+            on_message_id(184)
+        if len(attempts) == 1:
+            raise DeepSeekError("Слишком частые сообщения", "rate_limit_reached")
+        return {"lastAssistantMessageId": 184, "text": "ok", "thinking": ""}
+
+    c = _client(_complete_once=fake_once)
+    with mock.patch("asyncio.sleep", side_effect=lambda s: sleeps.append(s)):
+        result = _run(c.complete("sid", "prompt", req_id="t6", on_message_id=lambda m: None))
+
+    assert result == {"lastAssistantMessageId": 184, "text": "ok", "thinking": ""}
+    assert sleeps == [1], f"expected backoff 1s got {sleeps}"
+    assert len(attempts) == 2
+
+
 def test_retries_on_expert_busy_use_default():
     """expert_busy_use_default is retryable too."""
     sleeps = []
@@ -132,6 +158,7 @@ if __name__ == "__main__":
         test_no_retry_for_other_errors,
         test_all_retries_exhausted,
         test_no_retry_after_partial_output,
+        test_retries_after_message_id_only,
         test_retries_on_expert_busy_use_default,
         test_retryable_finish_reasons_set,
     ]
