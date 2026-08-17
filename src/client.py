@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -12,9 +13,16 @@ from .config import BASE_URL, COMPLETION_PATH, STOP_STREAM_PATH
 from .headers import base_headers
 from .pow import solve_pow
 from .proxy import get_http_client
-from .sse import stream_sse
+from .sse import DeepSeekError, stream_sse
 
 log = logging.getLogger("ds")
+
+# Backoff (seconds) between rate-limit retries. DeepSeek answers
+# "Слишком частые сообщения" (rate_limit_reached) when requests come in too
+# often. We retry with 1, 2, 4, 8, 16, 32, 64 s — 7 attempts total before the
+# error is propagated to the client. Delay values are logged so the real
+# needed spacing can be tuned later.
+_RATE_LIMIT_BACKOFF = [1, 2, 4, 8, 16, 32, 64]
 
 
 class AuthError(Exception):
@@ -233,7 +241,7 @@ class DeepSeekClient:
             log.debug(f"stop_stream failed: {e}")
             return False
 
-    async def complete(
+    async def _complete_once(
         self,
         session_id: str,
         prompt: str,
@@ -293,3 +301,95 @@ class DeepSeekClient:
             return await stream_sse(resp, on_text=on_text, on_thinking=on_thinking,
                                     on_message_id=on_message_id, debug=self.debug,
                                     req_id=req_id)
+
+    async def complete(
+        self,
+        session_id: str,
+        prompt: str,
+        model_type: str | None = None,
+        parent_message_id: Any = None,
+        thinking_enabled: bool = False,
+        search_enabled: bool = False,
+        ref_file_ids: list[str] | None = None,
+        req_id: str = "",
+        on_text: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
+        on_message_id: Callable[[int], None] | None = None,
+    ) -> dict:
+        """Call _complete_once, retrying on rate_limit_reached.
+
+        DeepSeek returns an SSE hint "Слишком частые сообщения" with
+        finish_reason=rate_limit_reached when we hit the per-user rate limit.
+        Retry with backoff 1, 2, 4, 8, 16, 32, 64 s. If the request still
+        fails after all retries the last error is propagated to the caller.
+        Retries happen only when the failure arrived before any content was
+        emitted — replaying an already-partially-streamed response would
+        duplicate output for the client.
+        """
+        emitted = {"text": False, "thinking": False, "message_id": False}
+
+        def _wrap_text(fn):
+            if fn is None:
+                return None
+            def wrapped(t):
+                if t:
+                    emitted["text"] = True
+                fn(t)
+            return wrapped
+
+        def _wrap_thinking(fn):
+            if fn is None:
+                return None
+            def wrapped(t):
+                if t:
+                    emitted["thinking"] = True
+                fn(t)
+            return wrapped
+
+        def _wrap_message_id(fn):
+            if fn is None:
+                return None
+            def wrapped(m):
+                emitted["message_id"] = True
+                fn(m)
+            return wrapped
+
+        for attempt in range(len(_RATE_LIMIT_BACKOFF) + 1):
+            try:
+                return await self._complete_once(
+                    session_id=session_id,
+                    prompt=prompt,
+                    model_type=model_type,
+                    parent_message_id=parent_message_id,
+                    thinking_enabled=thinking_enabled,
+                    search_enabled=search_enabled,
+                    ref_file_ids=ref_file_ids,
+                    req_id=req_id,
+                    on_text=_wrap_text(on_text),
+                    on_thinking=_wrap_thinking(on_thinking),
+                    on_message_id=_wrap_message_id(on_message_id),
+                )
+            except DeepSeekError as e:
+                if e.finish_reason != "rate_limit_reached":
+                    raise
+                if any(emitted.values()):
+                    log.warning(
+                        f"[REQ-{req_id}] rate_limit_reached after partial output "
+                        f"(text={emitted['text']} thinking={emitted['thinking']} "
+                        f"msg={emitted['message_id']}) — not retrying, propagating: {e.message}"
+                    )
+                    raise
+                if attempt >= len(_RATE_LIMIT_BACKOFF):
+                    log.warning(
+                        f"[REQ-{req_id}] rate_limit_reached — all {len(_RATE_LIMIT_BACKOFF)} "
+                        f"retries exhausted (delays={_RATE_LIMIT_BACKOFF}s), propagating error: {e.message}"
+                    )
+                    raise
+                delay = _RATE_LIMIT_BACKOFF[attempt]
+                log.warning(
+                    f"[REQ-{req_id}] rate_limit_reached (attempt {attempt + 1}/"
+                    f"{len(_RATE_LIMIT_BACKOFF) + 1}) — retry in {delay}s: {e.message}"
+                )
+                await asyncio.sleep(delay)
+        # Unreachable; keep linters happy.
+        raise DeepSeekError("rate_limit_reached after all retries", "rate_limit_reached")
