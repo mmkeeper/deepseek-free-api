@@ -5,7 +5,7 @@ from unittest import mock
 
 sys.path.insert(0, ".")
 
-from src.client import DeepSeekClient, _RATE_LIMIT_BACKOFF
+from src.client import DeepSeekClient, _RATE_LIMIT_BACKOFF, _RETRYABLE_FINISH_REASONS
 from src.sse import DeepSeekError
 
 
@@ -100,12 +100,40 @@ def test_no_retry_after_partial_output():
     assert sleeps == []
 
 
+def test_retries_on_expert_busy_use_default():
+    """expert_busy_use_default is retryable too."""
+    sleeps = []
+    attempts = []
+
+    async def fake_once(**kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise DeepSeekError("Сервер перегружен. Попробуйте позже или используйте быстрый режим.", "expert_busy_use_default")
+        return {"lastAssistantMessageId": 9, "text": "ok", "thinking": ""}
+
+    c = _client(_complete_once=fake_once)
+    with mock.patch("asyncio.sleep", side_effect=lambda s: sleeps.append(s)):
+        result = _run(c.complete("sid", "prompt", req_id="t5"))
+
+    assert result == {"lastAssistantMessageId": 9, "text": "ok", "thinking": ""}
+    assert sleeps == [1], f"expected backoff 1s got {sleeps}"
+    assert len(attempts) == 2
+
+
+def test_retryable_finish_reasons_set():
+    """The retryable finish reasons include both known transient errors."""
+    assert "rate_limit_reached" in _RETRYABLE_FINISH_REASONS
+    assert "expert_busy_use_default" in _RETRYABLE_FINISH_REASONS
+
+
 if __name__ == "__main__":
     tests = [
         test_retries_with_backoff_then_succeeds,
         test_no_retry_for_other_errors,
         test_all_retries_exhausted,
         test_no_retry_after_partial_output,
+        test_retries_on_expert_busy_use_default,
+        test_retryable_finish_reasons_set,
     ]
     for t in tests:
         try:

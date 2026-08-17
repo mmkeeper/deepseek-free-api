@@ -17,11 +17,13 @@ from .sse import DeepSeekError, stream_sse
 
 log = logging.getLogger("ds")
 
-# Backoff (seconds) between rate-limit retries. DeepSeek answers
-# "Слишком частые сообщения" (rate_limit_reached) when requests come in too
-# often. We retry with 1, 2, 4, 8, 16, 32, 64 s — 7 attempts total before the
-# error is propagated to the client. Delay values are logged so the real
-# needed spacing can be tuned later.
+# Backoff (seconds) between retries. DeepSeek answers with a retryable error
+# (rate_limit_reached — "Слишком частые сообщения", expert_busy_use_default —
+# "Сервер перегружен. Попробуйте позже или используйте быстрый режим") when
+# requests come in too often or the server is busy. Retry with 1, 2, 4, 8, 16,
+# 32, 64 s — 7 attempts total before the error is propagated to the client.
+# Delay values are logged so the real needed spacing can be tuned later.
+_RETRYABLE_FINISH_REASONS = {"rate_limit_reached", "expert_busy_use_default"}
 _RATE_LIMIT_BACKOFF = [1, 2, 4, 8, 16, 32, 64]
 
 
@@ -316,12 +318,14 @@ class DeepSeekClient:
         on_thinking: Callable[[str], None] | None = None,
         on_message_id: Callable[[int], None] | None = None,
     ) -> dict:
-        """Call _complete_once, retrying on rate_limit_reached.
+        """Call _complete_once, retrying on retryable errors.
 
-        DeepSeek returns an SSE hint "Слишком частые сообщения" with
-        finish_reason=rate_limit_reached when we hit the per-user rate limit.
-        Retry with backoff 1, 2, 4, 8, 16, 32, 64 s. If the request still
-        fails after all retries the last error is propagated to the caller.
+        DeepSeek returns an SSE hint with finish_reason=rate_limit_reached
+        ("Слишком частые сообщения") when we hit the per-user rate limit, or
+        finish_reason=expert_busy_use_default ("Сервер перегружен...") when
+        the server is busy. Retry with backoff 1, 2, 4, 8, 16, 32, 64 s. If
+        the request still fails after all retries the last error is propagated
+        to the caller.
         Retries happen only when the failure arrived before any content was
         emitted — replaying an already-partially-streamed response would
         duplicate output for the client.
@@ -370,24 +374,24 @@ class DeepSeekClient:
                     on_message_id=_wrap_message_id(on_message_id),
                 )
             except DeepSeekError as e:
-                if e.finish_reason != "rate_limit_reached":
+                if e.finish_reason not in _RETRYABLE_FINISH_REASONS:
                     raise
                 if any(emitted.values()):
                     log.warning(
-                        f"[REQ-{req_id}] rate_limit_reached after partial output "
+                        f"[REQ-{req_id}] {e.finish_reason} after partial output "
                         f"(text={emitted['text']} thinking={emitted['thinking']} "
                         f"msg={emitted['message_id']}) — not retrying, propagating: {e.message}"
                     )
                     raise
                 if attempt >= len(_RATE_LIMIT_BACKOFF):
                     log.warning(
-                        f"[REQ-{req_id}] rate_limit_reached — all {len(_RATE_LIMIT_BACKOFF)} "
+                        f"[REQ-{req_id}] {e.finish_reason} — all {len(_RATE_LIMIT_BACKOFF)} "
                         f"retries exhausted (delays={_RATE_LIMIT_BACKOFF}s), propagating error: {e.message}"
                     )
                     raise
                 delay = _RATE_LIMIT_BACKOFF[attempt]
                 log.warning(
-                    f"[REQ-{req_id}] rate_limit_reached (attempt {attempt + 1}/"
+                    f"[REQ-{req_id}] {e.finish_reason} (attempt {attempt + 1}/"
                     f"{len(_RATE_LIMIT_BACKOFF) + 1}) — retry in {delay}s: {e.message}"
                 )
                 await asyncio.sleep(delay)
