@@ -386,6 +386,15 @@ def _format_full_schema(params: dict) -> str:
     return json.dumps(params, ensure_ascii=False, separators=(",", ":"))
 
 
+def _first_paragraph(desc: str) -> str:
+    """Описание до первой пустой строки; многоточие, если сокращено."""
+    desc = desc.replace("\r\n", "\n").lstrip()
+    parts = desc.split("\n\n", 1)
+    if len(parts) == 2 and parts[1].strip():
+        return parts[0].rstrip() + "…"
+    return parts[0].rstrip()
+
+
 def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
     parts = []
     if tools:
@@ -406,7 +415,7 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
                 immediate_descs.append(f"  - {name}: {desc}\n    params: {schema}")
             else:
                 # Отложенный режим: схема параметров не показана.
-                deferred_descs.append(f"  - {name}: {desc}")
+                deferred_descs.append(f"  - {name}: {_first_paragraph(desc)}")
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
         tool_header += "  " + lt + "invoke" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
