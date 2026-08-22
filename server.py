@@ -339,7 +339,7 @@ def _pretty_json(text: str) -> str:
 
 
 def _tool_calls_to_xml(tool_calls: list | None) -> str:
-    """Convert OpenAI tool_calls to the taught <invoke> XML format."""
+    """Convert OpenAI tool_calls to the taught <tool_call> XML format."""
     if not tool_calls:
         return ""
     import json as _json
@@ -355,10 +355,10 @@ def _tool_calls_to_xml(tool_calls: list | None) -> str:
             args = _json.loads(args_str) if isinstance(args_str, str) else args_str
         except (_json.JSONDecodeError, TypeError):
             args = {}
-        lines.append(f"{lt}invoke name={dq}{name}{dq}{gt}")
+        lines.append(f"{lt}tool_call name={dq}{name}{dq}{gt}")
         for k, v in args.items():
             lines.append(f"  {lt}parameter name={dq}{k}{dq}{gt}{v}{lt}/parameter{gt}")
-        lines.append(f"{lt}/invoke{gt}")
+        lines.append(f"{lt}/tool_call{gt}")
     return "\n".join(lines)
 
 
@@ -418,15 +418,15 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
                 deferred_descs.append(f"  - {name}: {_first_paragraph(desc)}")
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
-        tool_header += "  " + lt + "invoke" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
+        tool_header += "  " + lt + "tool_call" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
         tool_header += "    " + lt + "parameter" + " name=" + dq + "PARAM_NAME" + dq + gt + "VALUE" + lt + "/parameter" + gt + chr(10)
-        tool_header += "  " + lt + "/invoke" + gt + chr(10)
+        tool_header += "  " + lt + "/tool_call" + gt + chr(10)
         tool_header += tc_close + chr(10)
         if immediate_descs:
-            tool_header += "Available tools:" + chr(10)
+            tool_header += "# Available tools:" + chr(10)
             tool_header += chr(10).join(immediate_descs) + chr(10)
         if deferred_descs:
-            tool_header += "Deferred tool catalog (call schemas via `tool_describe`, invoke via `tool_call`):" + chr(10)
+            tool_header += "# Deferred tool catalog (call schemas via `tool_describe`, invoke via `tool_call`):" + chr(10)
             tool_header += chr(10).join(deferred_descs) + chr(10)
         tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
         tool_header += chr(10)
