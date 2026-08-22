@@ -130,6 +130,37 @@ def test_json_inside_arguments():
     print("  PASS: JSON inside <arguments> (not Format 6 mis-parse)")
 
 
+def test_wrapper_with_direct_tool_tags():
+    """Гибрид: plural-обёртка + имя тула как прямой тег (без <name>)."""
+    text = """<tool_calls>
+<session_search>
+<query>анализ системного промта уменшился</query>
+</session_search>
+</tool_calls>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
+    assert tcs[0]["name"] == "session_search"
+    args = json.loads(tcs[0]["arguments"])
+    assert args == {"query": "анализ системного промта уменшился"}, f"bad args: {args}"
+    print("  PASS: <tool_calls> wrapper with direct tool tags")
+
+
+def test_wrapper_multiple_direct_tags():
+    text = """<tool_calls>
+<read_file>
+<path>C:\\x</path>
+</read_file>
+<web_search>
+<query>test query</query>
+</web_search>
+</tool_calls>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 2, f"expected 2 tool calls, got {len(tcs)}: {tcs}"
+    assert [t["name"] for t in tcs] == ["read_file", "web_search"]
+    assert json.loads(tcs[0]["arguments"]) == {"path": "C:\\x"}
+    print("  PASS: wrapper with multiple direct tool tags")
+
+
 def test_no_tool_call_in_plain_text():
     tcs = parse_tool_calls("Просто ответ без вызовов инструментов.")
     assert tcs == [], f"expected no tool calls, got {tcs}"
@@ -144,6 +175,8 @@ if __name__ == "__main__":
         test_nested_format_multiline_value,
         test_nested_format_no_arguments_wrapper,
         test_json_inside_arguments,
+        test_wrapper_with_direct_tool_tags,
+        test_wrapper_multiple_direct_tags,
         test_regression_hermes_format9,
         test_regression_invoke_format1,
         test_no_tool_call_in_plain_text,

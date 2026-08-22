@@ -713,6 +713,28 @@ def parse_tool_calls(text, available_tools=None):
                 if args:
                     tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
+    # Format 11: <tool_calls> wrapper with direct tool-name tags
+    # <tool_calls><tool_name><param>value</param></tool_name></tool_calls>
+    if not tool_calls:
+        tc = re.search(r'<tool_calls>(.*?)</tool_calls>', text, re.DOTALL)
+        if tc:
+            for m in re.finditer(r'<([^/>\s]+)>(.*?)</\1>', tc.group(1), re.DOTALL):
+                name, body = m.group(1), m.group(2)
+                if not _valid(name):
+                    continue
+                args = {}
+                for pm in re.finditer(r'<([^/>\s]+)>(.*?)</\1>', body, re.DOTALL):
+                    args[pm.group(1)] = _clean(pm.group(2))
+                if not args:
+                    try:
+                        c = body.strip()
+                        if c.startswith("{"):
+                            args = json.loads(c)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                if args:
+                    tool_calls.append({"name": name, "arguments": json.dumps(args)})
+
     # Bare JSON fallback
     if not tool_calls and available_names:
         try:
@@ -1070,7 +1092,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
                     # Check accumulated context for cross-chunk tool call detection
                     context = text_buf + text
-                    m = re.search(r'<(?:invoke|tool_call)[\s>]', context)
+                    m = re.search(r'<(?:invoke|tool_calls?)[\s>]', context)
                     if m:
                         tool_start = m.start()
                         before = _strip_tool_tags(context[:tool_start])
