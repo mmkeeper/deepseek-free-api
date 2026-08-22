@@ -393,32 +393,32 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
         dq = chr(34)
         tc_open = lt + "tool_calls" + gt
         tc_close = lt + "/tool_calls" + gt
-        tool_names = []
-        tool_descs = []
+        immediate_descs = []
+        deferred_descs = []
         for t in tools:
             func = t.get("function", {})
             name = func.get("name", "unknown")
             desc = func.get("description", "")
             params = func.get("parameters", {})
-            tool_names.append(name)
             if name in FULL_SCHEMA_TOOLS:
                 # Полный режим: имя + описание + полная схема параметров.
                 schema = _format_full_schema(params)
-                tool_descs.append(f"  - {name}: {desc}\n    params: {schema}")
+                immediate_descs.append(f"  - {name}: {desc}\n    params: {schema}")
             else:
                 # Отложенный режим: схема параметров не показана.
-                tool_descs.append(f"  - {name} [deferred]: {desc}")
-        tools_text = chr(10).join(tool_descs)
-        tool_names_str = ", ".join(tool_names)
+                deferred_descs.append(f"  - {name}: {desc}")
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
         tool_header += "  " + lt + "invoke" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
         tool_header += "    " + lt + "parameter" + " name=" + dq + "PARAM_NAME" + dq + gt + "VALUE" + lt + "/parameter" + gt + chr(10)
         tool_header += "  " + lt + "/invoke" + gt + chr(10)
         tool_header += tc_close + chr(10)
-        tool_header += "Available tools: " + tool_names_str + chr(10)
-        tool_header += tools_text + chr(10)
-        tool_header += "Tools marked [deferred] have their full parameter schemas omitted; request the full schema before calling them for the first time." + chr(10)
+        if immediate_descs:
+            tool_header += "Available tools:" + chr(10)
+            tool_header += chr(10).join(immediate_descs) + chr(10)
+        if deferred_descs:
+            tool_header += "Deferred tool catalog (call schemas via `tool_describe`, invoke via `tool_call`):" + chr(10)
+            tool_header += chr(10).join(deferred_descs) + chr(10)
         tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
         tool_header += chr(10)
         parts.insert(0, tool_header)
