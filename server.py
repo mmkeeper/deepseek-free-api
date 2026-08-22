@@ -221,7 +221,7 @@ def rlog(req_id: str, msg: str):
 
 # ─── XML tag stripping — keep content clean from tool markup ─
 
-_TOOL_TAG_RE = re.compile(r'</?(?:tool_calls|tool_call|invoke|parameter)[^>]*>')
+_TOOL_TAG_RE = re.compile(r'</?(?:tool_calls|tool_call|invoke|parameter|name|arguments)[^>]*>')
 
 
 def _strip_tool_tags(text: str) -> str:
@@ -339,13 +339,12 @@ def _pretty_json(text: str) -> str:
 
 
 def _tool_calls_to_xml(tool_calls: list | None) -> str:
-    """Convert OpenAI tool_calls to DeepSeek XML invoke format."""
+    """Convert OpenAI tool_calls to nested-element tool_call format."""
     if not tool_calls:
         return ""
     import json as _json
     lt = chr(60)
     gt = chr(62)
-    dq = chr(34)
     lines = []
     for tc in tool_calls:
         func = tc.get("function", {})
@@ -355,48 +354,93 @@ def _tool_calls_to_xml(tool_calls: list | None) -> str:
             args = _json.loads(args_str) if isinstance(args_str, str) else args_str
         except (_json.JSONDecodeError, TypeError):
             args = {}
-        lines.append(f"{lt}invoke name={dq}{name}{dq}{gt}")
+        lines.append(f"{lt}tool_call{gt}")
+        lines.append(f"  {lt}name{gt}{name}{lt}/name{gt}")
+        lines.append(f"  {lt}arguments{gt}")
         for k, v in args.items():
-            lines.append(f"  {lt}parameter name={dq}{k}{dq}{gt}{v}{lt}/parameter{gt}")
-        lines.append(f"{lt}/invoke{gt}")
+            lines.append(f"    {lt}{k}{gt}{v}{lt}/{k}{gt}")
+        lines.append(f"  {lt}/arguments{gt}")
+        lines.append(f"{lt}/tool_call{gt}")
     return "\n".join(lines)
 
 
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
 
+# Инструменты, для которых грузим ПОЛНУЮ схему параметров сразу.
+FULL_SCHEMA_TOOLS = {
+    "terminal",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "execute_code",
+    "web_search",
+    "web_extract",
+    "browser_exec",
+    "todo",
+    "memory",
+    "clarify",
+    "delegate_task",
+    "process",
+}
+# Максимальная длина описания для компактного режима (символов).
+COMPACT_DESC_LIMIT = 200
+
+
+def _format_full_schema(params: dict) -> str:
+    """Полная JSON-схема параметров в компактном (однострочном) виде."""
+    if not params:
+        return "{}"
+    return json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+
+
+def _short_desc(desc: str, limit: int = COMPACT_DESC_LIMIT) -> str:
+    """Первая строка описания, обрезанная до limit символов."""
+    first_line = desc.split("\n", 1)[0].strip()
+    if len(first_line) > limit:
+        return first_line[: limit - 1] + "…"
+    return first_line
+
+
 def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
     parts = []
     if tools:
-        tool_names = [t.get("function", {}).get("name", "unknown") for t in tools]
+        lt, gt = chr(60), chr(62)
+        tc_open = lt + "tool_call" + gt
+        tc_close = lt + "/tool_call" + gt
+        name_open = lt + "name" + gt
+        name_close = lt + "/name" + gt
+        args_open = lt + "arguments" + gt
+        args_close = lt + "/arguments" + gt
+        tool_names = []
         tool_descs = []
         for t in tools:
             func = t.get("function", {})
             name = func.get("name", "unknown")
             desc = func.get("description", "")
             params = func.get("parameters", {})
-            param_props = params.get("properties", {})
-            param_names = list(param_props.keys())
-            tool_descs.append(f"  - {name}: {desc} (params: {param_names})")
+            tool_names.append(name)
+            if name in FULL_SCHEMA_TOOLS:
+                # Полный режим: имя + описание + полная схема параметров.
+                schema = _format_full_schema(params)
+                tool_descs.append(f"  - {name}: {desc}\n    params: {schema}")
+            else:
+                # Компактный режим: только короткое описание.
+                tool_descs.append(f"  - {name}: {_short_desc(desc)}")
         tools_text = chr(10).join(tool_descs)
         tool_names_str = ", ".join(tool_names)
-        lt = chr(60)
-        gt = chr(62)
-        tc_open = lt + "tool_calls" + gt
-        tc_close = lt + "/tool_calls" + gt
-        inv_open = lt + "invoke" + gt
-        inv_close = lt + "/invoke" + gt
-        param_open = lt + "parameter" + gt
-        param_close = lt + "/parameter" + gt
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
-        tool_header += "  " + inv_open + chr(32) + "name=" + chr(34) + "TOOL_NAME" + chr(34) + chr(32) + inv_close + chr(10)
-        tool_header += "    " + param_open + chr(32) + "name=" + chr(34) + "PARAM_NAME" + chr(34) + chr(32) + param_close + " VALUE " + lt + "/parameter" + gt + chr(10)
-        tool_header += "  " + lt + "/invoke" + gt + chr(10)
+        tool_header += "  " + name_open + "TOOL_NAME" + name_close + chr(10)
+        tool_header += "  " + args_open + chr(10)
+        tool_header += "    " + lt + "PARAM_NAME" + gt + "VALUE" + lt + "/PARAM_NAME" + gt + chr(10)
+        tool_header += "  " + args_close + chr(10)
         tool_header += tc_close + chr(10)
         tool_header += "Available tools: " + tool_names_str + chr(10)
         tool_header += tools_text + chr(10)
         tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
         tool_header += chr(10)
+        parts.insert(0, tool_header)
     lt = chr(60)
     gt = chr(62)
     dq = chr(34)
@@ -535,7 +579,7 @@ def parse_tool_calls(text, available_tools=None):
                 if name:
                     available_names.add(name)
 
-    skip = {"thinking", "think", "tool_calls"}
+    skip = {"thinking", "think", "tool_calls", "arguments", "name"}
 
     def _valid(name):
         if not name or name.lower() in skip:
@@ -645,6 +689,27 @@ def parse_tool_calls(text, available_tools=None):
             name, props = m.group(1), m.group(2)
             if _valid(name):
                 args = _parse_props(props)
+                if args:
+                    tool_calls.append({"name": name, "arguments": json.dumps(args)})
+
+    # Format 10: nested elements <tool_call><name>X</name><arguments><p>v</p></arguments></tool_call>
+    if not tool_calls:
+        for m in re.finditer(r'<tool_call>\s*<name>([^<]+)</name>(.*?)</tool_call>', text, re.DOTALL):
+            name, body = m.group(1), m.group(2)
+            if _valid(name):
+                am = re.search(r'<arguments>(.*?)</arguments>', body, re.DOTALL)
+                inner = am.group(1) if am else body
+                args = {}
+                for pm in re.finditer(r'<([^/>\s]+)>(.*?)</\1>', inner, re.DOTALL):
+                    args[pm.group(1)] = _clean(pm.group(2))
+                if not args:
+                    # Модель может сымитировать JSON-схему из промпта
+                    try:
+                        c = inner.strip()
+                        if c.startswith("{"):
+                            args = json.loads(c)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 if args:
                     tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
@@ -827,7 +892,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             prev_text = prev.get("content") or ""
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
-            if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text):
+            if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text) or re.search(r'<tool_call>\s*<name>', prev_text):
                 is_tool_result = True
                 rlog(req_id, f"DETECT: prev assistant (via scan) has tool_call XML → tool_result")
             elif prev.get("tool_calls"):
@@ -1005,7 +1070,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
                     # Check accumulated context for cross-chunk tool call detection
                     context = text_buf + text
-                    m = re.search(r'<(?:invoke|tool_call)\s', context)
+                    m = re.search(r'<(?:invoke|tool_call)[\s>]', context)
                     if m:
                         tool_start = m.start()
                         before = _strip_tool_tags(context[:tool_start])
@@ -1046,7 +1111,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
                     # If mid-stream didn't fire, send text before first tool call now
                     if not in_tool_call:
-                        m = re.search(r'<(?:invoke|tool_call|tool_calls)\s', full_text)
+                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', full_text)
                         if m:
                             before = _strip_tool_tags(full_text[:m.start()])
                             if before:

@@ -19,7 +19,7 @@ def detect_tool_result(messages):
             prev_text = prev.get("content") or ""
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
-            if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text):
+            if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text) or re.search(r'<tool_call>\s*<name>', prev_text):
                 is_tool_result = True
             elif prev.get("tool_calls"):
                 is_tool_result = True
@@ -39,6 +39,18 @@ def test_xml_in_content():
     r, tid = detect_tool_result(msgs)
     assert r is True, f"expected True, got {r}"
     print(f"  PASS: XML in content -> tool_call_id={tid}")
+
+
+def test_nested_format_in_content():
+    msgs = [
+        {"role": "system", "content": "test"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": '<tool_call>\n  <name>search_files</name>\n</tool_call>'},
+        {"role": "user", "content": "tool result here"},
+    ]
+    r, tid = detect_tool_result(msgs)
+    assert r is True, f"expected True, got {r}"
+    print(f"  PASS: nested format in content -> detected={r}")
 
 
 def test_openai_tool_calls_field():
@@ -110,6 +122,7 @@ def test_openai_tool_calls_empty_content():
 if __name__ == "__main__":
     tests = [
         test_xml_in_content,
+        test_nested_format_in_content,
         test_openai_tool_calls_field,
         test_role_tool_message,
         test_regular_user_message,
