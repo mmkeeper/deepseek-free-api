@@ -339,12 +339,13 @@ def _pretty_json(text: str) -> str:
 
 
 def _tool_calls_to_xml(tool_calls: list | None) -> str:
-    """Convert OpenAI tool_calls to nested-element tool_call format."""
+    """Convert OpenAI tool_calls to the taught <invoke> XML format."""
     if not tool_calls:
         return ""
     import json as _json
     lt = chr(60)
     gt = chr(62)
+    dq = chr(34)
     lines = []
     for tc in tool_calls:
         func = tc.get("function", {})
@@ -354,13 +355,10 @@ def _tool_calls_to_xml(tool_calls: list | None) -> str:
             args = _json.loads(args_str) if isinstance(args_str, str) else args_str
         except (_json.JSONDecodeError, TypeError):
             args = {}
-        lines.append(f"{lt}tool_call{gt}")
-        lines.append(f"  {lt}name{gt}{name}{lt}/name{gt}")
-        lines.append(f"  {lt}arguments{gt}")
+        lines.append(f"{lt}invoke name={dq}{name}{dq}{gt}")
         for k, v in args.items():
-            lines.append(f"    {lt}{k}{gt}{v}{lt}/{k}{gt}")
-        lines.append(f"  {lt}/arguments{gt}")
-        lines.append(f"{lt}/tool_call{gt}")
+            lines.append(f"  {lt}parameter name={dq}{k}{dq}{gt}{v}{lt}/parameter{gt}")
+        lines.append(f"{lt}/invoke{gt}")
     return "\n".join(lines)
 
 
@@ -376,11 +374,7 @@ FULL_SCHEMA_TOOLS = {
     "execute_code",
     "web_search",
     "web_extract",
-    "browser_exec",
-    "todo",
     "memory",
-    "clarify",
-    "delegate_task",
     "process",
 }
 # Максимальная длина описания для компактного режима (символов).
@@ -394,24 +388,13 @@ def _format_full_schema(params: dict) -> str:
     return json.dumps(params, ensure_ascii=False, separators=(",", ":"))
 
 
-def _short_desc(desc: str, limit: int = COMPACT_DESC_LIMIT) -> str:
-    """Первая строка описания, обрезанная до limit символов."""
-    first_line = desc.split("\n", 1)[0].strip()
-    if len(first_line) > limit:
-        return first_line[: limit - 1] + "…"
-    return first_line
-
-
 def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
     parts = []
     if tools:
         lt, gt = chr(60), chr(62)
-        tc_open = lt + "tool_call" + gt
-        tc_close = lt + "/tool_call" + gt
-        name_open = lt + "name" + gt
-        name_close = lt + "/name" + gt
-        args_open = lt + "arguments" + gt
-        args_close = lt + "/arguments" + gt
+        dq = chr(34)
+        tc_open = lt + "tool_calls" + gt
+        tc_close = lt + "/tool_calls" + gt
         tool_names = []
         tool_descs = []
         for t in tools:
@@ -426,15 +409,14 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
                 tool_descs.append(f"  - {name}: {desc}\n    params: {schema}")
             else:
                 # Компактный режим: только короткое описание.
-                tool_descs.append(f"  - {name}: {_short_desc(desc)}")
+                tool_descs.append(f"  - {name}: {desc}")
         tools_text = chr(10).join(tool_descs)
         tool_names_str = ", ".join(tool_names)
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
-        tool_header += "  " + name_open + "TOOL_NAME" + name_close + chr(10)
-        tool_header += "  " + args_open + chr(10)
-        tool_header += "    " + lt + "PARAM_NAME" + gt + "VALUE" + lt + "/PARAM_NAME" + gt + chr(10)
-        tool_header += "  " + args_close + chr(10)
+        tool_header += "  " + lt + "invoke" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
+        tool_header += "    " + lt + "parameter" + " name=" + dq + "PARAM_NAME" + dq + gt + "VALUE" + lt + "/parameter" + gt + chr(10)
+        tool_header += "  " + lt + "/invoke" + gt + chr(10)
         tool_header += tc_close + chr(10)
         tool_header += "Available tools: " + tool_names_str + chr(10)
         tool_header += tools_text + chr(10)
