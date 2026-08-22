@@ -377,8 +377,6 @@ FULL_SCHEMA_TOOLS = {
     "memory",
     "process",
 }
-# Максимальная длина описания для компактного режима (символов).
-COMPACT_DESC_LIMIT = 200
 
 
 def _format_full_schema(params: dict) -> str:
@@ -408,8 +406,8 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
                 schema = _format_full_schema(params)
                 tool_descs.append(f"  - {name}: {desc}\n    params: {schema}")
             else:
-                # Компактный режим: только короткое описание.
-                tool_descs.append(f"  - {name}: {desc}")
+                # Отложенный режим: схема параметров не показана.
+                tool_descs.append(f"  - {name} [deferred]: {desc}")
         tools_text = chr(10).join(tool_descs)
         tool_names_str = ", ".join(tool_names)
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
@@ -420,6 +418,7 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
         tool_header += tc_close + chr(10)
         tool_header += "Available tools: " + tool_names_str + chr(10)
         tool_header += tools_text + chr(10)
+        tool_header += "Tools marked [deferred] have their full parameter schemas omitted; request the full schema before calling them for the first time." + chr(10)
         tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
         tool_header += chr(10)
         parts.insert(0, tool_header)
