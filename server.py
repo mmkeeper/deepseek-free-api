@@ -1183,11 +1183,13 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     # Mid-stream detected tool call but parsing failed
                     rlog(req_id, f"TOOL CALL PARSE FAILED — sending as filtered text")
                     remaining = _strip_tool_tags(tool_text_buf)
+                    rlog(req_id, f"STREAM CHUNK: filtered_text raw={len(tool_text_buf)} sent={len(remaining)}\n{remaining[:1500]}")
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
                 else:
                     # No tool calls — flush all buffered text
                     remaining = _strip_tool_tags(text_buf)
+                    rlog(req_id, f"STREAM CHUNK: flush_text raw={len(text_buf)} sent={len(remaining)}")
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
 
