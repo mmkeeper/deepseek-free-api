@@ -289,6 +289,16 @@ def test_unclosed_fence_masks_tail():
     print("  PASS: unclosed fence masks the tail (mask on)")
 
 
+def test_zero_argument_calls():
+    """Вызов без аргументов — валидный вызов (регресс: skills_list терялся, REQ-7b1f03000e)."""
+    tcs = parse_tool_calls('<tool_calls>\n<tool_call name="skills_list">\n\n</tool_call>\n</tool_calls>')
+    assert len(tcs) == 1 and tcs[0]["name"] == "skills_list", tcs
+    assert json.loads(tcs[0]["arguments"]) == {}
+    tcs = parse_tool_calls("<tool_call>\n<name>ping</name>\n</tool_call>")
+    assert len(tcs) == 1 and tcs[0]["name"] == "ping", tcs
+    print("  PASS: zero-argument calls parsed")
+
+
 def test_no_tool_call_in_plain_text():
     tcs = parse_tool_calls("Просто ответ без вызовов инструментов.")
     assert tcs == [], f"expected no tool calls, got {tcs}"
@@ -308,6 +318,7 @@ if __name__ == "__main__":
         test_json_inside_arguments,
         test_wrapper_with_direct_tool_tags,
         test_wrapper_multiple_direct_tags,
+        test_zero_argument_calls,
         test_example_in_code_fence_ignored,
         test_masking_disabled_parses_fenced_call,
         test_real_call_after_closed_fence,

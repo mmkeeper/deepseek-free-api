@@ -733,35 +733,32 @@ def parse_tool_calls(text, available_tools=None):
             if value and _valid(tool_name):
                 tool_calls.append({"name": tool_name, "arguments": json.dumps({param_name: value})})
 
-    # Format 9: Hermes-style <tool_call name="..."> with parameter tags
-    if not tool_calls:
-        for m in re.finditer('<tool_call\\s+name="([^"]+)"[^>]*>(.*?)</tool_call>', text, re.DOTALL):
-            name, props = m.group(1), m.group(2)
-            if _valid(name):
-                args = _parse_props(props)
-                if args:
-                    tool_calls.append({"name": name, "arguments": json.dumps(args)})
+    # Format 9: Hermes-style <tool_call name="..."> with parameter tags.
+    # Пустые аргументы валидны: явное имя тула — уже вызов (skills_list и т.п.)
+    for m in re.finditer('<tool_call\\s+name="([^"]+)"[^>]*>(.*?)</tool_call>', text, re.DOTALL):
+        name, props = m.group(1), m.group(2)
+        if _valid(name):
+            args = _parse_props(props) or {}
+            tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
     # Format 10: nested elements <tool_call><name>X</name><arguments><p>v</p></arguments></tool_call>
-    if not tool_calls:
-        for m in re.finditer(r'<tool_call>\s*<name>([^<]+)</name>(.*?)</tool_call>', text, re.DOTALL):
-            name, body = m.group(1), m.group(2)
-            if _valid(name):
-                am = re.search(r'<arguments>(.*?)</arguments>', body, re.DOTALL)
-                inner = am.group(1) if am else body
-                args = {}
-                for pm in re.finditer(r'<([^/>\s]+)>(.*?)</\1>', inner, re.DOTALL):
-                    args[pm.group(1)] = _clean(pm.group(2))
-                if not args:
-                    # Модель может сымитировать JSON-схему из промпта
-                    try:
-                        c = inner.strip()
-                        if c.startswith("{"):
-                            args = json.loads(c)
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                if args:
-                    tool_calls.append({"name": name, "arguments": json.dumps(args)})
+    for m in re.finditer(r'<tool_call>\s*<name>([^<]+)</name>(.*?)</tool_call>', text, re.DOTALL):
+        name, body = m.group(1), m.group(2)
+        if _valid(name):
+            am = re.search(r'<arguments>(.*?)</arguments>', body, re.DOTALL)
+            inner = am.group(1) if am else body
+            args = {}
+            for pm in re.finditer(r'<([^/>\s]+)>(.*?)</\1>', inner, re.DOTALL):
+                args[pm.group(1)] = _clean(pm.group(2))
+            if not args:
+                # Модель может сымитировать JSON-схему из промпта
+                try:
+                    c = inner.strip()
+                    if c.startswith("{"):
+                        args = json.loads(c)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
     # Format 11: <tool_calls> wrapper with direct tool-name tags
     # <tool_calls><tool_name><param>value</param></tool_name></tool_calls>
@@ -782,8 +779,7 @@ def parse_tool_calls(text, available_tools=None):
                             args = json.loads(c)
                     except (json.JSONDecodeError, ValueError):
                         pass
-                if args:
-                    tool_calls.append({"name": name, "arguments": json.dumps(args)})
+                tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
     # Bare JSON fallback
     if not tool_calls and available_names:
