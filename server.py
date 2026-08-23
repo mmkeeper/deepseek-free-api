@@ -225,7 +225,16 @@ _TOOL_TAG_RE = re.compile(r'</?(?:tool_calls|tool_call|invoke|parameter|name|arg
 
 
 def _strip_tool_tags(text: str) -> str:
-    return _TOOL_TAG_RE.sub("", text)
+    """Вырезает tool-разметку, не трогая содержимое ```-блоков (примеры формата)."""
+    if "```" not in text:
+        return _TOOL_TAG_RE.sub("", text)
+    parts = text.split("```")
+    out = []
+    for i, seg in enumerate(parts):
+        if i:
+            out.append("```")
+        out.append(_TOOL_TAG_RE.sub("", seg) if i % 2 == 0 else seg)
+    return "".join(out)
 
 
 # ─── Markdown fence masking — examples in ``` blocks are not tool calls ─

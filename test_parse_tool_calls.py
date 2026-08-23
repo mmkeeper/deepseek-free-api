@@ -3,7 +3,29 @@ import json
 import sys
 sys.path.insert(0, ".")
 
-from server import parse_tool_calls
+from server import parse_tool_calls, _strip_tool_tags
+
+
+def test_strip_tool_tags_keeps_code_fences():
+    """Стриппинг не трогает tool-разметку внутри ```-блоков (регресс: блок пропадал в Hermes)."""
+    text = """Текст до.
+
+```xml
+<tool_calls>
+  <tool_call name="tool_describe">
+    <parameter name="name">mcp__playwright__browser_navigate</parameter>
+  </tool_call>
+</tool_calls>
+```
+
+Текст после. <tool_call name="REAL"><parameter name="p">v</parameter></tool_call>"""
+    out = _strip_tool_tags(text)
+    assert '<tool_call name="tool_describe">' in out, "fence content must survive"
+    assert "mcp__playwright__browser_navigate" in out
+    assert "```xml" in out and "```" in out
+    assert "<tool_call name=\"REAL\">" not in out, "tags outside fences must be stripped"
+    assert "Текст после." in out and "v" in out  # inner text of real call stays
+    print("  PASS: _strip_tool_tags keeps fenced blocks intact")
 
 
 def test_nested_format_single():
@@ -217,6 +239,7 @@ def test_no_tool_call_in_plain_text():
 
 if __name__ == "__main__":
     tests = [
+        test_strip_tool_tags_keeps_code_fences,
         test_nested_format_single,
         test_nested_format_multiple,
         test_nested_format_cyrillic_params,
