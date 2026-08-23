@@ -415,7 +415,7 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
                 immediate_descs.append(f"  - {name}: {desc}\n    params: {schema}")
             else:
                 # Отложенный режим: схема параметров не показана.
-                deferred_descs.append(f"  - {name}: {_first_paragraph(desc)}")
+                deferred_descs.append(f"  - {name} [deferred]: {_first_paragraph(desc)}")
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
         tool_header += "  " + lt + "tool_call" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
@@ -426,6 +426,7 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
             tool_header += "# Available tools:" + chr(10)
             tool_header += chr(10).join(immediate_descs) + chr(10)
         if deferred_descs:
+            tool_header += chr(10)
             tool_header += "# Deferred tool catalog (call schemas via `tool_describe`, invoke via `tool_call`):" + chr(10)
             tool_header += chr(10).join(deferred_descs) + chr(10)
         tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
