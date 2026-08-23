@@ -233,6 +233,40 @@ def test_nested_quadruple_fence_defused():
     print("  PASS: nested quadruple-fence example defused")
 
 
+def test_tilde_fences_defused():
+    """Тильды-фенсы (~~~ и ~~~~) обезвреживаются как код-блоки."""
+    server.MASK_CODE_FENCES = True
+    try:
+        # 1. простой ~~~
+        src = "Пример:\n\n~~~\n<tool_call name=\"fake\"><parameter name=\"p\">v</parameter></tool_call>\n~~~\n"
+        assert parse_tool_calls(src) == [], parse_tool_calls(src)
+        out = _mask_code_fences(src)
+        assert "<t00l_call" in out and len(out) == len(src)
+
+        # 2. вложенные тильды: ~~~~ вокруг ~~~
+        src = ("~~~~\n~~~xml\n<tool_calls><tool_call name=\"x\">"
+               "<parameter name=\"q\">1</parameter></tool_call></tool_calls>\n~~~\n~~~~")
+        assert parse_tool_calls(src) == [], parse_tool_calls(src)
+        out = _mask_code_fences(src)
+        assert "<t00l_calls>" in out and len(out) == len(src)
+
+        # 3. закрытие не тем символом не закрывает регион: ~~~ открыт, ``` внутри игнорируется
+        src = "~~~\n<tool_call name=\"y\"></tool_call>\n```\nещё <tool_calls>\n~~~\nхвост"
+        assert parse_tool_calls(src) == [], parse_tool_calls(src)
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: tilde fences (incl. nested and type-mismatch) defused")
+
+
+def test_strip_tool_tags_keeps_tilde_fences():
+    """Стриппинг не трогает разметку внутри ~~~-фенсов."""
+    text = "до\n\n~~~\n<tool_calls><tool_call name=\"x\"><parameter name=\"p\">v</parameter></tool_call></tool_calls>\n~~~\n\nпосле <tool_call name=\"REAL\"></tool_call>"
+    out = _strip_tool_tags(text)
+    assert '<tool_call name="x">' in out, "tilde-fenced content must survive"
+    assert "<tool_call name=\"REAL\">" not in out
+    print("  PASS: _strip_tool_tags keeps tilde fences intact")
+
+
 def test_example_in_code_fence_ignored():
     """Пример формата внутри ```-блока — не реальный вызов (при включённой маске)."""
     server.MASK_CODE_FENCES = True
@@ -363,7 +397,9 @@ def test_no_tool_call_in_plain_text():
 if __name__ == "__main__":
     tests = [
         test_nested_quadruple_fence_defused,
+        test_tilde_fences_defused,
         test_strip_tool_tags_keeps_code_fences,
+        test_strip_tool_tags_keeps_tilde_fences,
         test_strip_tool_tags_keeps_inline_code_spans,
         test_mask_defuses_tool_word_in_fences,
         test_nested_format_single,

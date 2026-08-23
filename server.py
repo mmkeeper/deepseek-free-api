@@ -225,21 +225,22 @@ _TOOL_TAG_RE = re.compile(r'</?(?:tool_calls|tool_call|invoke|parameter|name|arg
 
 
 def _strip_tool_tags(text: str) -> str:
-    """Вырезает tool-разметку вне ```-блоков и вне `инлайн-кода`.
+    """Вырезает tool-разметку вне код-блоков (``` и ~~~) и вне `инлайн-кода`.
 
-    Примеры формата (в фенсах и одинарных бэктиках) должны доходить
-    до клиента нетронутыми.
+    Примеры формата должны доходить до клиента нетронутыми.
     """
-    if "`" not in text:
+    if "`" not in text and "~" not in text:
         return _TOOL_TAG_RE.sub("", text)
-    parts = text.split("```")
     out = []
-    for i, seg in enumerate(parts):
-        if i:
-            out.append("```")
-        if i % 2:
+    for seg, is_code in _code_segments(text):
+        if is_code:
             out.append(seg)  # внутри фенса — не трогаем
             continue
+        m = _FENCE_RUN_RE.match(seg)
+        if m:
+            # ведущий фенс-разделитель — вне инлайн-чётности
+            out.append(m.group(0))
+            seg = seg[m.end():]
         # вне фенса: защищаем инлайн-спаны `...`
         sub = seg.split("`")
         for j, piece in enumerate(sub):
@@ -258,13 +259,43 @@ def _strip_tool_tags(text: str) -> str:
 # False — искать разметку везде как в обычном тексте (эксперимент).
 MASK_CODE_FENCES = True
 
-_FENCE_RUN_RE = re.compile(r"`{3,}")
+_FENCE_RUN_RE = re.compile(r"`{3,}|~{3,}")
+
+
+def _code_segments(text: str) -> list[tuple[str, bool]]:
+    """Разбивает текст на (сегмент, inside_code).
+
+    Фенс — серия из 3+ бэктиков или тильд; закрывающим считается фенс того же
+    символа и не короче открывающего, поэтому вложенные блоки (```` вокруг
+    ```) образуют один регион.
+    """
+    segments: list[tuple[str, bool]] = []
+    pos = 0
+    inside = False
+    open_ch = ""
+    open_len = 0
+    pending = ""  # фенс-разделитель прикрепляется к следующему сегменту
+    for m in _FENCE_RUN_RE.finditer(text):
+        segments.append((pending + text[pos:m.start()], inside))
+        run = m.group(0)
+        pending = run
+        if not inside:
+            inside, open_ch, open_len = True, run[0], len(run)
+        elif run[0] == open_ch and len(run) >= open_len:
+            inside = False
+        pos = m.end()
+    segments.append((pending + text[pos:], inside))
+    return segments
 
 
 def _defuse_segment(seg: str, inside: bool) -> str:
-    """Сегмент вне фенсов: защищаем инлайн-спаны; внутри фенса — весь."""
+    """Сегмент вне кода: защищаем инлайн-спаны; внутри кода — весь."""
     if inside:
         return seg.replace("tool", "t00l")
+    m = _FENCE_RUN_RE.match(seg)
+    if m:
+        # ведущий фенс-разделитель (прикреплён токенайзером) — вне инлайн-чётности
+        return m.group(0) + _defuse_segment(seg[m.end():], False)
     if "`" not in seg:
         return seg
     parts = seg.split("`")
@@ -279,27 +310,11 @@ def _defuse_segment(seg: str, inside: bool) -> str:
 def _mask_code_fences(text: str) -> str:
     """Внутри код-блоков и инлайн-спанов заменяет 'tool' на 't00l'.
 
-    Фенс — серия из 3+ бэктиков; закрывающим считается фенс не короче
-    открывающего, поэтому вложенные блоки (```` вокруг ```) обрабатываются
-    как один регион. Длина сохраняется — смещения совпадают с оригиналом.
+    Длина сохраняется — смещения совпадают с оригиналом.
     """
-    if "`" not in text:
+    if "`" not in text and "~" not in text:
         return text
-    out = []
-    pos = 0
-    inside = False
-    open_len = 0
-    for m in _FENCE_RUN_RE.finditer(text):
-        out.append(_defuse_segment(text[pos:m.start()], inside))
-        out.append(m.group(0))
-        length = len(m.group(0))
-        if not inside:
-            inside, open_len = True, length
-        elif length >= open_len:
-            inside, open_len = False, 0
-        pos = m.end()
-    out.append(_defuse_segment(text[pos:], inside))
-    return "".join(out)
+    return "".join(_defuse_segment(seg, code) for seg, code in _code_segments(text))
 
 PREFIX = "dsf-"
 
