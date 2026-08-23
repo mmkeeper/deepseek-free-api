@@ -249,31 +249,29 @@ def _strip_tool_tags(text: str) -> str:
     return "".join(out)
 
 
-# ─── Markdown fence masking — examples in ``` blocks are not tool calls ─
+# ─── Markdown fence defusing — examples in ``` blocks are not tool calls ─
 
-# Маскировать содержимое ```-блоков перед поиском tool calls (примеры формата
-# в код-блоках не считаются вызовами). Отключено для эксперимента — верните
-# True, чтобы включить обратно.
-MASK_CODE_FENCES = False
+# Обезвреживать разметку внутри ```-блоков: слово tool -> t00l. Примеры формата
+# перестают выглядеть вызовами: прокси их не исполняет, и до клиента они
+# доходят видимым текстом (санитайзер Hermes такую разметку не прячет).
+# False — искать разметку в код-блоках как в обычном тексте (эксперимент).
+MASK_CODE_FENCES = True
 
 
 def _mask_code_fences(text: str) -> str:
-    """Заменяет содержимое ```-блоков пробелами, сохраняя длину и переводы строк.
+    """Внутри ```-блоков заменяет 'tool' на 't00l', длина сохраняется.
 
-    Нечётное число фенсов (незакрытый блок в конце) маскирует весь хвост.
+    Нечётное число фенсов (незакрытый блок в конце) обрабатывает весь хвост.
     """
     if "```" not in text:
         return text
     parts = text.split("```")
     out = []
     for i, seg in enumerate(parts):
-        out.append(re.sub(r"[^\n]", " ", seg) if i % 2 else seg)
+        if i:
+            out.append("```")
+        out.append(seg.replace("tool", "t00l") if i % 2 else seg)
     return "".join(out)
-
-
-def _inside_code_fence(prefix: str) -> bool:
-    """True, если позиция сразу после prefix лежит внутри открытого ```-блока."""
-    return prefix.count("```") % 2 == 1
 
 PREFIX = "dsf-"
 
@@ -615,8 +613,8 @@ def openai_tool_calls_response(chunk_id, created, model, tool_calls):
 def parse_tool_calls(text, available_tools=None):
     """Parse tool calls from LLM text output.
 
-    Содержимое ```-блоков игнорируется: примеры формата в код-блоках
-    не являются реальными вызовами.
+    Разметка внутри ```-блоков обезвреживается (tool -> t00l): примеры
+    формата в код-блоках не являются реальными вызовами.
     """
     import re, json
     if MASK_CODE_FENCES:
@@ -1143,12 +1141,16 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                         tool_text_buf += text
                         return
 
-                    # Check accumulated context for cross-chunk tool call detection
+                    # Check accumulated context for cross-chunk tool call detection.
+                    # Поиск ведётся по обезвреженной копии (длина совпадает с
+                    # оригиналом, смещения валидны): разметка внутри фенсов
+                    # невидима и не останавливает стрим.
                     context = text_buf + text
-                    m = re.search(r'<(?:invoke|tool_calls?)[\s>]', context)
-                    if m and not (MASK_CODE_FENCES and _inside_code_fence(context[:m.start()])):
+                    ctx = _mask_code_fences(context) if MASK_CODE_FENCES else context
+                    m = re.search(r'<(?:invoke|tool_calls?)[\s>]', ctx)
+                    if m:
                         tool_start = m.start()
-                        before = _strip_tool_tags(context[:tool_start])
+                        before = _strip_tool_tags(ctx[:tool_start])
                         if before:
                             on_chunk(openai_chunk(chunk_id, created, model, before, None))
                         tool_text_buf = context[tool_start:]
@@ -1186,9 +1188,10 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
                     # If mid-stream didn't fire, send text before first tool call now
                     if not in_tool_call:
-                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', _mask_code_fences(full_text) if MASK_CODE_FENCES else full_text)
+                        masked_full = _mask_code_fences(full_text) if MASK_CODE_FENCES else full_text
+                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', masked_full)
                         if m:
-                            before = _strip_tool_tags(full_text[:m.start()])
+                            before = _strip_tool_tags(masked_full[:m.start()])
                             if before:
                                 chunk_str = openai_chunk(chunk_id, created, model, before, None)
                                 rlog(req_id, f"STREAM CHUNK: text_before_tool ({len(before)} chars)  size={len(chunk_str)}")
@@ -1201,13 +1204,15 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 elif in_tool_call:
                     # Mid-stream detected tool call but parsing failed
                     rlog(req_id, f"TOOL CALL PARSE FAILED — sending as filtered text")
-                    remaining = _strip_tool_tags(tool_text_buf)
+                    src = _mask_code_fences(tool_text_buf) if MASK_CODE_FENCES else tool_text_buf
+                    remaining = _strip_tool_tags(src)
                     rlog(req_id, f"STREAM CHUNK: filtered_text raw={len(tool_text_buf)} sent={len(remaining)}\n{remaining[:1500]}")
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
                 else:
                     # No tool calls — flush all buffered text
-                    remaining = _strip_tool_tags(text_buf)
+                    src = _mask_code_fences(text_buf) if MASK_CODE_FENCES else text_buf
+                    remaining = _strip_tool_tags(src)
                     rlog(req_id, f"STREAM CHUNK: flush_text raw={len(text_buf)} sent={len(remaining)}\n{remaining[:1500]}")
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
@@ -1308,7 +1313,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
         response_body = json.loads(openai_tool_calls_response(chunk_id, created, model, tool_calls))
     else:
-        response_body = json.loads(openai_full(chunk_id, created, model, full_text))
+        content_out = _mask_code_fences(full_text) if MASK_CODE_FENCES else full_text
+        response_body = json.loads(openai_full(chunk_id, created, model, content_out))
 
     if full_thinking:
         response_body["thinking"] = full_thinking

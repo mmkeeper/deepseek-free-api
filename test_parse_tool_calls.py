@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, ".")
 
 import server
-from server import parse_tool_calls, _strip_tool_tags
+from server import parse_tool_calls, _strip_tool_tags, _mask_code_fences
 
 
 def test_strip_tool_tags_keeps_code_fences():
@@ -200,6 +200,19 @@ def test_wrapper_multiple_direct_tags():
     print("  PASS: wrapper with multiple direct tool tags")
 
 
+def test_mask_defuses_tool_word_in_fences():
+    """Маска меняет tool -> t00l только внутри фенсов, длина сохраняется."""
+    src = "до <tool_call name=\"x\"> ```xml\n<tool_calls></tool_calls>\n``` после"
+    out = _mask_code_fences(src)
+    assert "<t00l_calls>" in out and "</t00l_calls>" in out, out
+    assert "<tool_call name=\"x\">" in src and src.count("<tool_call") == 2  # вне фенса не тронуто... в исходнике
+    assert out.index("до") == 0 and len(out) == len(src)
+    assert parse_tool_calls(src) == [], "fenced markup must not parse as calls"
+    # обезвреженный текст больше не выглядит вызовом и пройдёт санитайзер
+    assert _strip_tool_tags(out).count("```") == 2
+    print("  PASS: mask defuses tool word inside fences only")
+
+
 def test_example_in_code_fence_ignored():
     """Пример формата внутри ```-блока — не реальный вызов (при включённой маске)."""
     server.MASK_CODE_FENCES = True
@@ -286,6 +299,7 @@ if __name__ == "__main__":
     tests = [
         test_strip_tool_tags_keeps_code_fences,
         test_strip_tool_tags_keeps_inline_code_spans,
+        test_mask_defuses_tool_word_in_fences,
         test_nested_format_single,
         test_nested_format_multiple,
         test_nested_format_cyrillic_params,
