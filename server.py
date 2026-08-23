@@ -387,6 +387,11 @@ def _format_full_schema(params: dict) -> str:
     return json.dumps(params, ensure_ascii=False, separators=(",", ":"))
 
 
+# Сокращать описания отложенных тулов до первого абзаца (см. _first_paragraph).
+# Сейчас отключено: выводим полные описания, как их передаёт клиент.
+SHORTEN_DEFERRED_DESC = False
+
+
 def _first_paragraph(desc: str) -> str:
     """Описание до первой пустой строки; многоточие, если сокращено."""
     desc = desc.replace("\r\n", "\n").lstrip()
@@ -416,7 +421,8 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
                 immediate_descs.append(f"  - {name}: {desc}\n    params: {schema}")
             else:
                 # Отложенный режим: схема параметров не показана.
-                deferred_descs.append(f"  - {name} [deferred]: {_first_paragraph(desc)}")
+                d = _first_paragraph(desc) if SHORTEN_DEFERRED_DESC else desc
+                deferred_descs.append(f"  - {name} [deferred]: {d}")
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
         tool_header += "  " + lt + "tool_call" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
