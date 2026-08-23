@@ -301,6 +301,41 @@ def test_zero_argument_calls():
     print("  PASS: zero-argument calls parsed")
 
 
+def test_single_inline_mention_breaks_nothing():
+    """Одиночные упоминания tool_call в тексте не дают фантомных вызовов."""
+    server.MASK_CODE_FENCES = True
+    try:
+        # 1. бэктикнутое одиночное упоминание открывающего тега
+        tcs = parse_tool_calls("Оберните вызов в `<tool_call name=\"x\">` и дождитесь результата.")
+        assert tcs == [], tcs
+
+        # 2. бэктикнутый ПОЛНЫЙ пример с аргументами — тоже не вызов
+        tcs = parse_tool_calls(
+            "Формат такой: `<tool_call name=\"terminal\">"
+            "<parameter name=\"command\">ls</parameter></tool_call>` — и всё.")
+        assert tcs == [], tcs
+
+        # 3. упоминание + реальный вызов в одном сообщении -> парсится только реальный
+        msg = ("Пример: `<tool_call name=\"fake\"><parameter name=\"p\">v</parameter></tool_call>`.\n\n"
+               "<tool_call name=\"skills_list\"></tool_call>")
+        tcs = parse_tool_calls(msg)
+        assert len(tcs) == 1 and tcs[0]["name"] == "skills_list", tcs
+
+        # 4. mid-stream: маскированный контекст не матчится на инлайн-упоминании,
+        #    но матчится на реальном вызове (смещения валидны)
+        import re
+        from server import _mask_code_fences
+        buf = "Пример: `<tool_call name=\"fake\">`.\n\n<tool_call name=\"skills_list\"></tool_call>"
+        ctx = _mask_code_fences(buf)
+        m = re.search(r'<(?:invoke|tool_calls?)[\s>]', ctx)
+        assert m is not None
+        assert ctx[m.start():].startswith("<tool_call name=\"skills_list\""), ctx[m.start():m.start()+40]
+        assert len(ctx) == len(buf)
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: single inline mentions produce no phantoms, real call intact")
+
+
 def test_no_tool_call_in_plain_text():
     tcs = parse_tool_calls("Просто ответ без вызовов инструментов.")
     assert tcs == [], f"expected no tool calls, got {tcs}"
@@ -321,6 +356,7 @@ if __name__ == "__main__":
         test_wrapper_with_direct_tool_tags,
         test_wrapper_multiple_direct_tags,
         test_zero_argument_calls,
+        test_single_inline_mention_breaks_nothing,
         test_example_in_code_fence_ignored,
         test_masking_disabled_parses_fenced_call,
         test_real_call_after_closed_fence,
