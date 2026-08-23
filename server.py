@@ -251,35 +251,54 @@ def _strip_tool_tags(text: str) -> str:
 
 # ─── Markdown fence defusing — examples in ``` blocks are not tool calls ─
 
-# Обезвреживать разметку внутри ```-блоков И `инлайн-спанов` при ПОИСКЕ
+# Обезвреживать разметку внутри код-блоков И `инлайн-спанов` при ПОИСКЕ
 # вызовов: слово tool -> t00l, чтобы примеры формата и упоминания тегов
 # в тексте не исполнялись и не останавливали стрим. Только для поиска —
 # клиенту текст доставляется как есть, без подстановок.
 # False — искать разметку везде как в обычном тексте (эксперимент).
 MASK_CODE_FENCES = True
 
+_FENCE_RUN_RE = re.compile(r"`{3,}")
+
+
+def _defuse_segment(seg: str, inside: bool) -> str:
+    """Сегмент вне фенсов: защищаем инлайн-спаны; внутри фенса — весь."""
+    if inside:
+        return seg.replace("tool", "t00l")
+    if "`" not in seg:
+        return seg
+    parts = seg.split("`")
+    out = []
+    for j, piece in enumerate(parts):
+        if j:
+            out.append("`")
+        out.append(piece.replace("tool", "t00l") if j % 2 else piece)
+    return "".join(out)
+
 
 def _mask_code_fences(text: str) -> str:
-    """Внутри ```-блоков и `инлайн-спанов` заменяет 'tool' на 't00l'.
+    """Внутри код-блоков и инлайн-спанов заменяет 'tool' на 't00l'.
 
-    Длина сохраняется — смещения совпадают с оригиналом. Нечётное число
-    фенсов (незакрытый блок в конце) обрабатывает весь хвост.
+    Фенс — серия из 3+ бэктиков; закрывающим считается фенс не короче
+    открывающего, поэтому вложенные блоки (```` вокруг ```) обрабатываются
+    как один регион. Длина сохраняется — смещения совпадают с оригиналом.
     """
     if "`" not in text:
         return text
-    parts = text.split("```")
     out = []
-    for i, seg in enumerate(parts):
-        if i:
-            out.append("```")
-        if i % 2:
-            out.append(seg.replace("tool", "t00l"))
-            continue
-        sub = seg.split("`")
-        for j, piece in enumerate(sub):
-            if j:
-                out.append("`")
-            out.append(piece.replace("tool", "t00l") if j % 2 else piece)
+    pos = 0
+    inside = False
+    open_len = 0
+    for m in _FENCE_RUN_RE.finditer(text):
+        out.append(_defuse_segment(text[pos:m.start()], inside))
+        out.append(m.group(0))
+        length = len(m.group(0))
+        if not inside:
+            inside, open_len = True, length
+        elif length >= open_len:
+            inside, open_len = False, 0
+        pos = m.end()
+    out.append(_defuse_segment(text[pos:], inside))
     return "".join(out)
 
 PREFIX = "dsf-"

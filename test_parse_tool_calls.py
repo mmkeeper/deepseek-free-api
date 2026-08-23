@@ -215,6 +215,24 @@ def test_mask_defuses_tool_word_in_fences():
     print("  PASS: mask defuses tool word inside fences and inline spans")
 
 
+def test_nested_quadruple_fence_defused():
+    """Вложенные фенсы (```` вокруг ```) — один регион, вызов не исполняется
+    (регресс лога REQ-77bbf30013: фантомный execute_code)."""
+    server.MASK_CODE_FENCES = True
+    try:
+        src = ("````markdown\n```xml\n<tool_calls>\n  <tool_call name=\"execute_code\">\n"
+               "    <parameter name=\"code\">print('это просто текст')</parameter>\n"
+               "  </tool_call>\n</tool_calls>\n```\n````\n"
+               "Это текст, а не вызов.")
+        out = _mask_code_fences(src)
+        assert "<t00l_call" in out and "tool" not in out.split("Это текст")[0].replace("````", "").replace("```xml", ""), out
+        assert len(out) == len(src)
+        assert parse_tool_calls(src) == [], f"fenced example must not parse: {parse_tool_calls(src)}"
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: nested quadruple-fence example defused")
+
+
 def test_example_in_code_fence_ignored():
     """Пример формата внутри ```-блока — не реальный вызов (при включённой маске)."""
     server.MASK_CODE_FENCES = True
@@ -344,6 +362,7 @@ def test_no_tool_call_in_plain_text():
 
 if __name__ == "__main__":
     tests = [
+        test_nested_quadruple_fence_defused,
         test_strip_tool_tags_keeps_code_fences,
         test_strip_tool_tags_keeps_inline_code_spans,
         test_mask_defuses_tool_word_in_fences,
