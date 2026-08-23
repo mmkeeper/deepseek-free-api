@@ -376,6 +376,7 @@ FULL_SCHEMA_TOOLS = {
     "web_extract",
     "memory",
     "process",
+    "tool_describe",
 }
 
 
