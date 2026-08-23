@@ -207,16 +207,16 @@ def test_mask_defuses_tool_word_in_fences():
            " `упоминание <tool_calls>`\n```xml\n<tool_calls></tool_calls>\n```\nпосле")
     out = _mask_code_fences(src)
     assert "<t00l_calls>" in out and "</t00l_calls>" in out, out
-    # содержимое спана забелено (грависы остались)
+    # содержимое спана сохраняется дословно (точечный суб только гравис-тегов)
     i = out.index("`", out.index("до <tool_call"))
     span = out[i:i + 30]
-    assert "`" in span and "упоминание" not in out[i:], span
+    assert "`" in span and span.startswith("`упоминание <tool_calls>`"), span
     assert "<tool_call name=\"x\">" in out, "real call outside spans/fences must survive"
     assert len(out) == len(src)
     # фенснутая и инлайн разметка не парсится, реальный вызов парсится
     tcs = parse_tool_calls(src)
     assert len(tcs) == 1 and tcs[0]["name"] == "x", tcs
-    print("  PASS: mask defuses fences, blanks spans, keeps real calls")
+    print("  PASS: mask defuses fences, preserves prose mentions, keeps real calls")
 
 
 def test_nested_quadruple_fence_defused():

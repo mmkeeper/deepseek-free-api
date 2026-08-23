@@ -251,6 +251,9 @@ MASK_CODE_FENCES = True
 
 _FENCE_RUN_RE = re.compile(r"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})")
 _SPAN_TOKEN_RE = re.compile(r"(`{3,}|`)")
+# Гравис-обёрнутые туловые теги в прозе: `<tool_calls>`, `</tool_call>`,
+# `<parameter name="...">` и т.п. Обезвреживаются точечно, без состояния.
+_SPAN_TOOL_TAG_RE = re.compile(r"`(?:</?(?:tool_calls?|invoke|parameter|name|arguments)\b[^`]*)`")
 
 
 def _walk_outside(seg: str, span_fn, outside_fn) -> str:
@@ -312,11 +315,17 @@ def _code_segments(text: str) -> list[tuple[str, bool]]:
 
 
 def _defuse_segment(seg: str, inside: bool) -> str:
-    """Сегмент кода: tool->t00l; вне кода инлайн-спаны забеливаются,
-    остальной текст (в т.ч. реальные вызовы) остаётся поисковым."""
+    """Сегмент кода: tool->t00l; вне кода гравис-обёрнутые туловые теги
+    заменяются пробелами (длина сохраняется) — без stateful-обхода спанов,
+    чтобы нечётный бэктик не обезвреживал весь хвост ответа."""
     if inside:
         return seg.replace("tool", "t00l")
-    return _walk_outside(seg, _blank_span, lambda p: p)
+    m = _FENCE_RUN_RE.match(seg)
+    prefix = ""
+    if m:
+        prefix = m.group(0)
+        seg = seg[m.end():]
+    return prefix + _SPAN_TOOL_TAG_RE.sub(lambda mm: "`" + " " * (len(mm.group(0)) - 2) + "`", seg)
 
 
 def _mask_code_fences(text: str) -> str:
