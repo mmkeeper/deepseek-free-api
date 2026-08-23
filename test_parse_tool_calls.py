@@ -201,16 +201,18 @@ def test_wrapper_multiple_direct_tags():
 
 
 def test_mask_defuses_tool_word_in_fences():
-    """Маска меняет tool -> t00l только внутри фенсов, длина сохраняется."""
-    src = "до <tool_call name=\"x\"> ```xml\n<tool_calls></tool_calls>\n``` после"
+    """Маска меняет tool -> t00l внутри фенсов И инлайн-спанов, длина сохраняется."""
+    src = ("до <tool_call name=\"x\"><parameter name=\"p\">1</parameter></tool_call>"
+           " `упоминание <tool_calls>` ```xml\n<tool_calls></tool_calls>\n``` после")
     out = _mask_code_fences(src)
     assert "<t00l_calls>" in out and "</t00l_calls>" in out, out
-    assert "<tool_call name=\"x\">" in src and src.count("<tool_call") == 2  # вне фенса не тронуто... в исходнике
-    assert out.index("до") == 0 and len(out) == len(src)
-    assert parse_tool_calls(src) == [], "fenced markup must not parse as calls"
-    # обезвреженный текст больше не выглядит вызовом и пройдёт санитайзер
-    assert _strip_tool_tags(out).count("```") == 2
-    print("  PASS: mask defuses tool word inside fences only")
+    assert "`упоминание <t00l_calls>`" in out, "inline span must be defused too"
+    assert "<tool_call name=\"x\">" in out, "real call outside spans/fences must survive"
+    assert len(out) == len(src)
+    # фенснутая и инлайн разметка не парсится, реальный вызов парсится
+    tcs = parse_tool_calls(src)
+    assert len(tcs) == 1 and tcs[0]["name"] == "x", tcs
+    print("  PASS: mask defuses tool word inside fences and inline spans")
 
 
 def test_example_in_code_fence_ignored():

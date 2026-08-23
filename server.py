@@ -251,26 +251,35 @@ def _strip_tool_tags(text: str) -> str:
 
 # ─── Markdown fence defusing — examples in ``` blocks are not tool calls ─
 
-# Обезвреживать разметку внутри ```-блоков при ПОИСКЕ вызовов: слово
-# tool -> t00l, чтобы примеры формата не исполнялись. Только для поиска —
+# Обезвреживать разметку внутри ```-блоков И `инлайн-спанов` при ПОИСКЕ
+# вызовов: слово tool -> t00l, чтобы примеры формата и упоминания тегов
+# в тексте не исполнялись и не останавливали стрим. Только для поиска —
 # клиенту текст доставляется как есть, без подстановок.
-# False — искать разметку в код-блоках как в обычном тексте (эксперимент).
+# False — искать разметку везде как в обычном тексте (эксперимент).
 MASK_CODE_FENCES = True
 
 
 def _mask_code_fences(text: str) -> str:
-    """Внутри ```-блоков заменяет 'tool' на 't00l', длина сохраняется.
+    """Внутри ```-блоков и `инлайн-спанов` заменяет 'tool' на 't00l'.
 
-    Нечётное число фенсов (незакрытый блок в конце) обрабатывает весь хвост.
+    Длина сохраняется — смещения совпадают с оригиналом. Нечётное число
+    фенсов (незакрытый блок в конце) обрабатывает весь хвост.
     """
-    if "```" not in text:
+    if "`" not in text:
         return text
     parts = text.split("```")
     out = []
     for i, seg in enumerate(parts):
         if i:
             out.append("```")
-        out.append(seg.replace("tool", "t00l") if i % 2 else seg)
+        if i % 2:
+            out.append(seg.replace("tool", "t00l"))
+            continue
+        sub = seg.split("`")
+        for j, piece in enumerate(sub):
+            if j:
+                out.append("`")
+            out.append(piece.replace("tool", "t00l") if j % 2 else piece)
     return "".join(out)
 
 PREFIX = "dsf-"
