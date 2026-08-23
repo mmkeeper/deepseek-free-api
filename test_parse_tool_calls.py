@@ -3,6 +3,7 @@ import json
 import sys
 sys.path.insert(0, ".")
 
+import server
 from server import parse_tool_calls, _strip_tool_tags
 
 
@@ -200,8 +201,10 @@ def test_wrapper_multiple_direct_tags():
 
 
 def test_example_in_code_fence_ignored():
-    """Пример формата внутри ```-блока — не реальный вызов (регресс лога REQ-0735210002)."""
-    text = """Вот как вызывать инструменты:
+    """Пример формата внутри ```-блока — не реальный вызов (при включённой маске)."""
+    server.MASK_CODE_FENCES = True
+    try:
+        text = """Вот как вызывать инструменты:
 
 ```
 <tool_calls>
@@ -212,14 +215,34 @@ def test_example_in_code_fence_ignored():
 ```
 
 Нужно ещё что-то?"""
+        tcs = parse_tool_calls(text)
+        assert tcs == [], f"expected no tool calls, got {tcs}"
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: example inside code fence ignored (mask on)")
+
+
+def test_masking_disabled_parses_fenced_call():
+    """При выключенной маске вызов из код-блока парсится (текущее экспериментальное поведение)."""
+    assert server.MASK_CODE_FENCES is False
+    text = """```
+<tool_calls>
+  <tool_call name="tool_describe">
+    <parameter name="name">mcp__playwright__browser_navigate</parameter>
+  </tool_call>
+</tool_calls>
+```"""
     tcs = parse_tool_calls(text)
-    assert tcs == [], f"expected no tool calls, got {tcs}"
-    print("  PASS: example inside code fence ignored")
+    assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
+    assert tcs[0]["name"] == "tool_describe"
+    print("  PASS: masking disabled -> fenced call parses")
 
 
 def test_real_call_after_closed_fence():
     """Реальный вызов после закрытого код-блока с примером парсится."""
-    text = """Пример:
+    server.MASK_CODE_FENCES = True
+    try:
+        text = """Пример:
 
 ```
 <tool_call name="FAKE">
@@ -232,19 +255,25 @@ def test_real_call_after_closed_fence():
 <tool_call name="search_files">
   <parameter name="path">C:\\Projects</parameter>
 </tool_call>"""
-    tcs = parse_tool_calls(text)
-    assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
-    assert tcs[0]["name"] == "search_files"
-    assert json.loads(tcs[0]["arguments"]) == {"path": "C:\\Projects"}
-    print("  PASS: real call after closed fence parsed")
+        tcs = parse_tool_calls(text)
+        assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
+        assert tcs[0]["name"] == "search_files"
+        assert json.loads(tcs[0]["arguments"]) == {"path": "C:\\Projects"}
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: real call after closed fence parsed (mask on)")
 
 
 def test_unclosed_fence_masks_tail():
     """Незакрытый фенс маскирует весь хвост — вызовов нет."""
-    text = "Смотри:\n\n```\n<tool_call name=\"fake\"><parameter name=\"p\">v</parameter>"
-    tcs = parse_tool_calls(text)
-    assert tcs == [], f"expected no tool calls, got {tcs}"
-    print("  PASS: unclosed fence masks the tail")
+    server.MASK_CODE_FENCES = True
+    try:
+        text = "Смотри:\n\n```\n<tool_call name=\"fake\"><parameter name=\"p\">v</parameter>"
+        tcs = parse_tool_calls(text)
+        assert tcs == [], f"expected no tool calls, got {tcs}"
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: unclosed fence masks the tail (mask on)")
 
 
 def test_no_tool_call_in_plain_text():
@@ -266,6 +295,7 @@ if __name__ == "__main__":
         test_wrapper_with_direct_tool_tags,
         test_wrapper_multiple_direct_tags,
         test_example_in_code_fence_ignored,
+        test_masking_disabled_parses_fenced_call,
         test_real_call_after_closed_fence,
         test_unclosed_fence_masks_tail,
         test_regression_hermes_format9,

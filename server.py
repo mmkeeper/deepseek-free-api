@@ -251,6 +251,12 @@ def _strip_tool_tags(text: str) -> str:
 
 # ─── Markdown fence masking — examples in ``` blocks are not tool calls ─
 
+# Маскировать содержимое ```-блоков перед поиском tool calls (примеры формата
+# в код-блоках не считаются вызовами). Отключено для эксперимента — верните
+# True, чтобы включить обратно.
+MASK_CODE_FENCES = False
+
+
 def _mask_code_fences(text: str) -> str:
     """Заменяет содержимое ```-блоков пробелами, сохраняя длину и переводы строк.
 
@@ -613,7 +619,8 @@ def parse_tool_calls(text, available_tools=None):
     не являются реальными вызовами.
     """
     import re, json
-    text = _mask_code_fences(text)
+    if MASK_CODE_FENCES:
+        text = _mask_code_fences(text)
     tool_calls = []
     available_names = set()
     if available_tools:
@@ -959,7 +966,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             prev_text = prev.get("content") or ""
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
-            _masked_prev = _mask_code_fences(prev_text)
+            _masked_prev = _mask_code_fences(prev_text) if MASK_CODE_FENCES else prev_text
             if re.search(r'<tool_call\s+name=', _masked_prev) or re.search(r'<invoke\s+name=', _masked_prev) or re.search(r'<tool_call>\s*<name>', _masked_prev):
                 is_tool_result = True
                 rlog(req_id, f"DETECT: prev assistant (via scan) has tool_call XML → tool_result")
@@ -1139,7 +1146,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     # Check accumulated context for cross-chunk tool call detection
                     context = text_buf + text
                     m = re.search(r'<(?:invoke|tool_calls?)[\s>]', context)
-                    if m and not _inside_code_fence(context[:m.start()]):
+                    if m and not (MASK_CODE_FENCES and _inside_code_fence(context[:m.start()])):
                         tool_start = m.start()
                         before = _strip_tool_tags(context[:tool_start])
                         if before:
@@ -1179,7 +1186,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
                     # If mid-stream didn't fire, send text before first tool call now
                     if not in_tool_call:
-                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', _mask_code_fences(full_text))
+                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', _mask_code_fences(full_text) if MASK_CODE_FENCES else full_text)
                         if m:
                             before = _strip_tool_tags(full_text[:m.start()])
                             if before:
