@@ -1239,8 +1239,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
                 tc_log = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else "[]"
                 rlog(req_id, f"→ PROXY → HERMES  text={len(full_text)}chars think={len(think_text)}chars tool_calls={len(tool_calls)} finish={finish_reason}")
-                rlog(req_id, f"→ PROXY → HERMES  text_content:\n{full_text[:2000]}")
-                rlog(req_id, f"→ PROXY → HERMES  think_content:\n{think_text[:2000]}")
+                rlog(req_id, f"→ PROXY → HERMES  text_content (первые 2000 из {len(full_text)}):\n{full_text[:2000]}")
+                rlog(req_id, f"→ PROXY → HERMES  think_content (первые 2000 из {len(think_text)}):\n{think_text[:2000]}")
                 rlog(req_id, f"→ PROXY → HERMES  tool_calls_content: {tc_log[:2000]}")
                 on_done()
             except asyncio.CancelledError:
