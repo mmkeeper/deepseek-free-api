@@ -161,6 +161,54 @@ def test_wrapper_multiple_direct_tags():
     print("  PASS: wrapper with multiple direct tool tags")
 
 
+def test_example_in_code_fence_ignored():
+    """Пример формата внутри ```-блока — не реальный вызов (регресс лога REQ-0735210002)."""
+    text = """Вот как вызывать инструменты:
+
+```
+<tool_calls>
+  <tool_call name="ИМЯ_ИНСТРУМЕНТА">
+    <parameter name="ПАРАМЕТР">ЗНАЧЕНИЕ</parameter>
+  </tool_call>
+</tool_calls>
+```
+
+Нужно ещё что-то?"""
+    tcs = parse_tool_calls(text)
+    assert tcs == [], f"expected no tool calls, got {tcs}"
+    print("  PASS: example inside code fence ignored")
+
+
+def test_real_call_after_closed_fence():
+    """Реальный вызов после закрытого код-блока с примером парсится."""
+    text = """Пример:
+
+```
+<tool_call name="FAKE">
+<parameter name="x">1</parameter>
+</tool_call>
+```
+
+А теперь по делу:
+
+<tool_call name="search_files">
+  <parameter name="path">C:\\Projects</parameter>
+</tool_call>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
+    assert tcs[0]["name"] == "search_files"
+    assert json.loads(tcs[0]["arguments"]) == {"path": "C:\\Projects"}
+    print("  PASS: real call after closed fence parsed")
+
+
+def test_unclosed_fence_masks_tail():
+    """Незакрытый фенс маскирует весь хвост — вызовов нет."""
+    text = "Смотри:\n\n```\n<tool_call name=\"fake\"><parameter name=\"p\">v</parameter>"
+    tcs = parse_tool_calls(text)
+    assert tcs == [], f"expected no tool calls, got {tcs}"
+    print("  PASS: unclosed fence masks the tail")
+
+
 def test_no_tool_call_in_plain_text():
     tcs = parse_tool_calls("Просто ответ без вызовов инструментов.")
     assert tcs == [], f"expected no tool calls, got {tcs}"
@@ -177,6 +225,9 @@ if __name__ == "__main__":
         test_json_inside_arguments,
         test_wrapper_with_direct_tool_tags,
         test_wrapper_multiple_direct_tags,
+        test_example_in_code_fence_ignored,
+        test_real_call_after_closed_fence,
+        test_unclosed_fence_masks_tail,
         test_regression_hermes_format9,
         test_regression_invoke_format1,
         test_no_tool_call_in_plain_text,

@@ -227,6 +227,27 @@ _TOOL_TAG_RE = re.compile(r'</?(?:tool_calls|tool_call|invoke|parameter|name|arg
 def _strip_tool_tags(text: str) -> str:
     return _TOOL_TAG_RE.sub("", text)
 
+
+# ─── Markdown fence masking — examples in ``` blocks are not tool calls ─
+
+def _mask_code_fences(text: str) -> str:
+    """Заменяет содержимое ```-блоков пробелами, сохраняя длину и переводы строк.
+
+    Нечётное число фенсов (незакрытый блок в конце) маскирует весь хвост.
+    """
+    if "```" not in text:
+        return text
+    parts = text.split("```")
+    out = []
+    for i, seg in enumerate(parts):
+        out.append(re.sub(r"[^\n]", " ", seg) if i % 2 else seg)
+    return "".join(out)
+
+
+def _inside_code_fence(prefix: str) -> bool:
+    """True, если позиция сразу после prefix лежит внутри открытого ```-блока."""
+    return prefix.count("```") % 2 == 1
+
 PREFIX = "dsf-"
 
 _tool_call_counter = 0
@@ -565,8 +586,13 @@ def openai_tool_calls_response(chunk_id, created, model, tool_calls):
 
 
 def parse_tool_calls(text, available_tools=None):
-    """Parse tool calls from LLM text output."""
+    """Parse tool calls from LLM text output.
+
+    Содержимое ```-блоков игнорируется: примеры формата в код-блоках
+    не являются реальными вызовами.
+    """
     import re, json
+    text = _mask_code_fences(text)
     tool_calls = []
     available_names = set()
     if available_tools:
@@ -912,7 +938,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             prev_text = prev.get("content") or ""
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
-            if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text) or re.search(r'<tool_call>\s*<name>', prev_text):
+            _masked_prev = _mask_code_fences(prev_text)
+            if re.search(r'<tool_call\s+name=', _masked_prev) or re.search(r'<invoke\s+name=', _masked_prev) or re.search(r'<tool_call>\s*<name>', _masked_prev):
                 is_tool_result = True
                 rlog(req_id, f"DETECT: prev assistant (via scan) has tool_call XML → tool_result")
             elif prev.get("tool_calls"):
@@ -1091,7 +1118,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     # Check accumulated context for cross-chunk tool call detection
                     context = text_buf + text
                     m = re.search(r'<(?:invoke|tool_calls?)[\s>]', context)
-                    if m:
+                    if m and not _inside_code_fence(context[:m.start()]):
                         tool_start = m.start()
                         before = _strip_tool_tags(context[:tool_start])
                         if before:
@@ -1131,7 +1158,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
                     # If mid-stream didn't fire, send text before first tool call now
                     if not in_tool_call:
-                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', full_text)
+                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', _mask_code_fences(full_text))
                         if m:
                             before = _strip_tool_tags(full_text[:m.start()])
                             if before:
