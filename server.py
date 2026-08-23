@@ -225,15 +225,27 @@ _TOOL_TAG_RE = re.compile(r'</?(?:tool_calls|tool_call|invoke|parameter|name|arg
 
 
 def _strip_tool_tags(text: str) -> str:
-    """Вырезает tool-разметку, не трогая содержимое ```-блоков (примеры формата)."""
-    if "```" not in text:
+    """Вырезает tool-разметку вне ```-блоков и вне `инлайн-кода`.
+
+    Примеры формата (в фенсах и одинарных бэктиках) должны доходить
+    до клиента нетронутыми.
+    """
+    if "`" not in text:
         return _TOOL_TAG_RE.sub("", text)
     parts = text.split("```")
     out = []
     for i, seg in enumerate(parts):
         if i:
             out.append("```")
-        out.append(_TOOL_TAG_RE.sub("", seg) if i % 2 == 0 else seg)
+        if i % 2:
+            out.append(seg)  # внутри фенса — не трогаем
+            continue
+        # вне фенса: защищаем инлайн-спаны `...`
+        sub = seg.split("`")
+        for j, piece in enumerate(sub):
+            if j:
+                out.append("`")
+            out.append(_TOOL_TAG_RE.sub("", piece) if j % 2 == 0 else piece)
     return "".join(out)
 
 
@@ -1189,7 +1201,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 else:
                     # No tool calls — flush all buffered text
                     remaining = _strip_tool_tags(text_buf)
-                    rlog(req_id, f"STREAM CHUNK: flush_text raw={len(text_buf)} sent={len(remaining)}")
+                    rlog(req_id, f"STREAM CHUNK: flush_text raw={len(text_buf)} sent={len(remaining)}\n{remaining[:1500]}")
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
 

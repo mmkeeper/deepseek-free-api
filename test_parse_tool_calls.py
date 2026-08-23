@@ -28,6 +28,22 @@ def test_strip_tool_tags_keeps_code_fences():
     print("  PASS: _strip_tool_tags keeps fenced blocks intact")
 
 
+def test_strip_tool_tags_keeps_inline_code_spans():
+    """Инлайн-упоминания в одинарных бэктиках (таблицы, проза) не вырезаются."""
+    text = """Формат: `<tool_calls>`, вызов — `<tool_call name="x">`.
+
+| Элемент | Роль |
+|---|---|
+| `<tool_calls>` | обёртка |
+| `<parameter name="...">` | аргумент |
+
+А это реальный вызов (должен вырезаться): <tool_call name="REAL"><parameter name="p">v</parameter></tool_call>"""
+    out = _strip_tool_tags(text)
+    assert "`<tool_calls>`" in out and "`<parameter name=\"...\">`" in out, "inline spans must survive"
+    assert "<tool_call name=\"REAL\">" not in out
+    print("  PASS: inline code spans preserved")
+
+
 def test_nested_format_single():
     text = """Подумаю, какой инструмент нужен.
 
@@ -240,6 +256,7 @@ def test_no_tool_call_in_plain_text():
 if __name__ == "__main__":
     tests = [
         test_strip_tool_tags_keeps_code_fences,
+        test_strip_tool_tags_keeps_inline_code_spans,
         test_nested_format_single,
         test_nested_format_multiple,
         test_nested_format_cyrillic_params,
