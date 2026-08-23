@@ -236,17 +236,7 @@ def _strip_tool_tags(text: str) -> str:
         if is_code:
             out.append(seg)  # внутри фенса — не трогаем
             continue
-        m = _FENCE_RUN_RE.match(seg)
-        if m:
-            # ведущий фенс-разделитель — вне инлайн-чётности
-            out.append(m.group(0))
-            seg = seg[m.end():]
-        # вне фенса: защищаем инлайн-спаны `...`
-        sub = seg.split("`")
-        for j, piece in enumerate(sub):
-            if j:
-                out.append("`")
-            out.append(_TOOL_TAG_RE.sub("", piece) if j % 2 == 0 else piece)
+        out.append(_walk_outside(seg, lambda p: p, lambda p: _TOOL_TAG_RE.sub("", p)))
     return "".join(out)
 
 
@@ -259,15 +249,47 @@ def _strip_tool_tags(text: str) -> str:
 # False — искать разметку везде как в обычном тексте (эксперимент).
 MASK_CODE_FENCES = True
 
-_FENCE_RUN_RE = re.compile(r"`{3,}|~{3,}")
+_FENCE_RUN_RE = re.compile(r"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})")
+_SPAN_TOKEN_RE = re.compile(r"(`{3,}|`)")
+
+
+def _walk_outside(seg: str, span_fn, outside_fn) -> str:
+    """Обход вне-кодового сегмента: серии из 3+ бэктиков дословно (это не
+    спаны и не фенсы), одиночные — границы инлайн-спана. К содержимому спанов
+    применяется span_fn, к остальному тексту — outside_fn."""
+    m = _FENCE_RUN_RE.match(seg)
+    prefix = ""
+    if m:
+        prefix = m.group(0)
+        seg = seg[m.end():]
+    out = [prefix]
+    in_span = False
+    pos = 0
+    for t in _SPAN_TOKEN_RE.finditer(seg):
+        piece = seg[pos:t.start()]
+        out.append(span_fn(piece) if in_span else outside_fn(piece))
+        token = t.group(0)
+        out.append(token)
+        if len(token) == 1:
+            in_span = not in_span
+        pos = t.end()
+    tail = seg[pos:]
+    out.append(span_fn(tail) if in_span else outside_fn(tail))
+    return "".join(out)
+
+
+def _blank_span(piece: str) -> str:
+    """Забеливает содержимое инлайн-спана, сохраняя длину и переводы строк."""
+    return "".join(c if c == "\n" else " " for c in piece)
 
 
 def _code_segments(text: str) -> list[tuple[str, bool]]:
     """Разбивает текст на (сегмент, inside_code).
 
-    Фенс — серия из 3+ бэктиков или тильд; закрывающим считается фенс того же
-    символа и не короче открывающего, поэтому вложенные блоки (```` вокруг
-    ```) образуют один регион.
+    Фенс — серия из 3+ бэктиков или тильд НА ОТДЕЛЬНОЙ СТРОКЕ (отступ до
+    3 пробелов); внутристрочные серии вроде '```' в значениях параметров —
+    обычный текст. Закрывающим считается фенс того же символа и не короче
+    открывающего, поэтому вложенные блоки образуют один регион.
     """
     segments: list[tuple[str, bool]] = []
     pos = 0
@@ -277,11 +299,12 @@ def _code_segments(text: str) -> list[tuple[str, bool]]:
     pending = ""  # фенс-разделитель прикрепляется к следующему сегменту
     for m in _FENCE_RUN_RE.finditer(text):
         segments.append((pending + text[pos:m.start()], inside))
-        run = m.group(0)
+        run = m.group()
         pending = run
+        body_len = len(run.lstrip(" \t"))
         if not inside:
-            inside, open_ch, open_len = True, run[0], len(run)
-        elif run[0] == open_ch and len(run) >= open_len:
+            inside, open_ch, open_len = True, run.lstrip()[0], body_len
+        elif run.lstrip()[0] == open_ch and body_len >= open_len:
             inside = False
         pos = m.end()
     segments.append((pending + text[pos:], inside))
@@ -289,22 +312,11 @@ def _code_segments(text: str) -> list[tuple[str, bool]]:
 
 
 def _defuse_segment(seg: str, inside: bool) -> str:
-    """Сегмент вне кода: защищаем инлайн-спаны; внутри кода — весь."""
+    """Сегмент кода: tool->t00l; вне кода инлайн-спаны забеливаются,
+    остальной текст (в т.ч. реальные вызовы) остаётся поисковым."""
     if inside:
         return seg.replace("tool", "t00l")
-    m = _FENCE_RUN_RE.match(seg)
-    if m:
-        # ведущий фенс-разделитель (прикреплён токенайзером) — вне инлайн-чётности
-        return m.group(0) + _defuse_segment(seg[m.end():], False)
-    if "`" not in seg:
-        return seg
-    parts = seg.split("`")
-    out = []
-    for j, piece in enumerate(parts):
-        if j:
-            out.append("`")
-        out.append(piece.replace("tool", "t00l") if j % 2 else piece)
-    return "".join(out)
+    return _walk_outside(seg, _blank_span, lambda p: p)
 
 
 def _mask_code_fences(text: str) -> str:

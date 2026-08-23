@@ -201,18 +201,22 @@ def test_wrapper_multiple_direct_tags():
 
 
 def test_mask_defuses_tool_word_in_fences():
-    """Маска меняет tool -> t00l внутри фенсов И инлайн-спанов, длина сохраняется."""
+    """Фенсы: tool->t00l; инлайн-спаны: забеливаются для поиска;
+    реальный вызов вне их парсится, длина сохраняется."""
     src = ("до <tool_call name=\"x\"><parameter name=\"p\">1</parameter></tool_call>"
-           " `упоминание <tool_calls>` ```xml\n<tool_calls></tool_calls>\n``` после")
+           " `упоминание <tool_calls>`\n```xml\n<tool_calls></tool_calls>\n```\nпосле")
     out = _mask_code_fences(src)
     assert "<t00l_calls>" in out and "</t00l_calls>" in out, out
-    assert "`упоминание <t00l_calls>`" in out, "inline span must be defused too"
+    # содержимое спана забелено (грависы остались)
+    i = out.index("`", out.index("до <tool_call"))
+    span = out[i:i + 30]
+    assert "`" in span and "упоминание" not in out[i:], span
     assert "<tool_call name=\"x\">" in out, "real call outside spans/fences must survive"
     assert len(out) == len(src)
     # фенснутая и инлайн разметка не парсится, реальный вызов парсится
     tcs = parse_tool_calls(src)
     assert len(tcs) == 1 and tcs[0]["name"] == "x", tcs
-    print("  PASS: mask defuses tool word inside fences and inline spans")
+    print("  PASS: mask defuses fences, blanks spans, keeps real calls")
 
 
 def test_nested_quadruple_fence_defused():
@@ -265,6 +269,29 @@ def test_strip_tool_tags_keeps_tilde_fences():
     assert '<tool_call name="x">' in out, "tilde-fenced content must survive"
     assert "<tool_call name=\"REAL\">" not in out
     print("  PASS: _strip_tool_tags keeps tilde fences intact")
+
+
+def test_midline_backtick_run_in_param_value():
+    """'```' ВНУТРИ строки значения параметра — не фенс; вызов парсится
+    (регресс лога REQ-a9d47a0026: write_file с проверкой '```' в коде)."""
+    server.MASK_CODE_FENCES = True
+    try:
+        src = ('<tool_calls>\n<tool_call name="write_file">\n'
+               '<parameter name="content">import os\n'
+               "if any(k in head for k in ['markdown', 'fence', '```']):\n"
+               "    print(fp)\n"
+               "</parameter>\n"
+               '<parameter name="path">C:/tmp/x.py</parameter>\n'
+               "</tool_call>\n</tool_calls>")
+        tcs = parse_tool_calls(src)
+        assert len(tcs) == 1 and tcs[0]["name"] == "write_file", tcs
+        args = json.loads(tcs[0]["arguments"])
+        assert "'```'" in args["content"], args
+        assert "print(fp)" in args["content"]
+        assert args["path"] == "C:/tmp/x.py"
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: mid-line backtick run in param value is not a fence")
 
 
 def test_example_in_code_fence_ignored():
@@ -397,6 +424,7 @@ def test_no_tool_call_in_plain_text():
 if __name__ == "__main__":
     tests = [
         test_nested_quadruple_fence_defused,
+        test_midline_backtick_run_in_param_value,
         test_tilde_fences_defused,
         test_strip_tool_tags_keeps_code_fences,
         test_strip_tool_tags_keeps_tilde_fences,
