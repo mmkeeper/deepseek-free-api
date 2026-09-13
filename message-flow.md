@@ -89,18 +89,22 @@ for k, v in list(_session_store.items()):
 body = await request.json()
 messages = body.get("messages", [])
 stream = body.get("stream", False)
-model = strip_prefix(body.get("model", "deepseek-chat"))
+model = strip_prefix(body.get("model", "deepseek-flash"))
 tools = body.get("tools")
 ```
 
 ### 3.2 Модели
 
-Модели рекламируются с префиксом `dsf-`: `dsf-deepseek-chat`, `dsf-deepseek-reasoner`, `dsf-deepseek-vision`. Префикс отрезается перед отправкой в DeepSeek.
+Единая модель рекламируется с префиксом `dsf-`: `dsf-deepseek-flash`
+(DeepSeek-V4.1-Flash). Префикс отрезается перед отправкой в DeepSeek.
 
-Тип модели определяет `model_type`:
-- `reasoner` или `r1` → `"expert"`
-- `vision` → `"vision"`
-- остальные → `"default"`
+`model_type` определяется автоматически из запроса:
+- есть `image_url`/`image` в сообщениях → `"vision"` (картинки загружаются через `ref_file_ids`)
+- есть `file`/`input_file` → файлы загружаются через `ref_file_ids`, `model_type` остаётся `"default"` (как в веб-клиенте)
+- иначе → `"default"` (мышление и поиск управляются флагами `thinking_enabled`/`search_enabled`)
+
+Старые имена `dsf-deepseek-chat`, `dsf-deepseek-reasoner`, `dsf-deepseek-vision`
+принимаются как алиасы и перенаправляются на ту же модель.
 
 ### 3.3 Определение тул-резолтов
 
@@ -131,11 +135,13 @@ elif len(messages) >= 2:
 
 ```
 1. Решить PoW (Proof of Work) challenge
-2. POST /api/v0/chat/completion с:
+2. Если в запросе есть вложения (изображения/файлы) — загрузить их через /api/v0/file/upload_file
+3. POST /api/v0/chat/completion с:
    - chat_session_id (из хранилища или новая)
    - parent_message_id (для продолжения диалога)
    - prompt (текст сообщений)
    - model_type
+   - ref_file_ids (id загруженных вложений)
    - thinking_enabled, search_enabled
    - x-ds-pow-response header
 ```
@@ -152,9 +158,16 @@ DeepSeek требует решения PoW-задачи для каждого co
 
 Прокси строит prompt в разных форматах в зависимости от контекста:
 
-**Новая сессия** — полная конвертация через `messages_to_prompt`:
+**Новая сессия** — полная конвертация через `messages_to_prompt`. Префиксы
+`System:`/`User:`/`Assistant:` добавляются только когда в запросе есть системный
+промпт. Без него отправляется чистый текст сообщений, чтобы первое сообщение на
+сайте выглядело естественно:
 ```
-System: ...\n\nAssistant: ...\n\nUser: ...\n\nAssistant:
+# с системным промптом
+System: ...\n\nUser: ...\n\nAssistant:
+
+# без системного промпта
+привет
 ```
 
 **Повторное использование сессии** (системные сообщения + последнее user):
@@ -199,7 +212,7 @@ on_thinking(text) → openai_chunk(reasoning_content=text)
 on_text(text)     → openai_chunk(content=text)
 ```
 
-При переходе от thinking к text отправляется маркер `</think>`.
+При переходе от thinking к text никаких маркеров в content не отправляется: рассуждения идут только через `reasoning_content`, текст — через `content`. (Ранние версии дополнительно слали литеральные чанки ` thinking`/` response` — они накапливались клиентом в тексте ассистента и попадали в саммари новых сессий.)
 
 ---
 

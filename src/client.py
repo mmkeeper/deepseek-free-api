@@ -26,6 +26,12 @@ log = logging.getLogger("ds")
 _RETRYABLE_FINISH_REASONS = {"rate_limit_reached", "expert_busy_use_default"}
 _RATE_LIMIT_BACKOFF = [1, 2, 4, 8, 16, 32, 64]
 
+# Polling backoff (seconds) between fetch_files attempts while a file is being
+# processed on DeepSeek's side (status PENDING → SUCCESS). Doubling delays give
+# fast feedback for small files (first poll after 0.5s) yet patience for large
+# PDFs/xlsx that take tens of seconds to index.
+_FILE_READY_BACKOFF = [0.5, 1, 2, 4, 8, 16, 32, 64]
+
 
 class AuthError(Exception):
     def __init__(self, context: str):
@@ -128,6 +134,7 @@ class DeepSeekClient:
         data: bytes,
         model_type: str = "vision",
         thinking_enabled: bool = True,
+        req_id: str = "",
     ) -> str:
         """Upload a file to DeepSeek and return the file_id."""
         import aiohttp
@@ -154,14 +161,46 @@ class DeepSeekClient:
             async with session.post(url, headers=headers, data=form) as resp:
                 result = await resp.json()
 
+        if req_id:
+            log.debug(f"[REQ-{req_id}] upload_file response: {json.dumps(result)[:2000]}")
+
         if result.get("code") != 0:
             raise RuntimeError(f"File upload failed: {result.get('msg', 'unknown')}")
 
         file_id = result["data"]["biz_data"]["id"]
         return file_id
 
+    async def upload_and_confirm(
+        self,
+        filename: str,
+        data: bytes,
+        model_type: str = "vision",
+        thinking_enabled: bool = True,
+        req_id: str = "",
+    ) -> str:
+        """Upload a file and wait until it is ready, returning its canonical id.
+
+        Files go through an async processing pipeline (PENDING → SUCCESS/FAILED)
+        and the completion endpoint rejects not-yet-ready files with
+        "invalid ref file id", so confirm via fetch_files before using the id.
+        """
+        file_id = await self.upload_file(filename, data, model_type=model_type,
+                                         thinking_enabled=thinking_enabled, req_id=req_id)
+        if req_id:
+            log.debug(f"[REQ-{req_id}] uploaded {filename} -> {file_id}")
+        files = await self.fetch_files([file_id])
+        if req_id:
+            log.debug(f"[REQ-{req_id}] fetch_files response: {json.dumps(files)[:2000]}")
+        for f in files:
+            if f.get("status") == "SUCCESS":
+                return f.get("id") or file_id
+        raise RuntimeError(
+            f"File {file_id} did not become ready "
+            f"(statuses={[f.get('status') for f in files]})"
+        )
+
     async def fetch_files(self, file_ids: list[str]) -> list[dict]:
-        """Poll file status until all are SUCCESS."""
+        """Poll file status until all are SUCCESS, doubling wait between attempts."""
         import asyncio
 
         client = get_http_client()
@@ -169,7 +208,7 @@ class DeepSeekClient:
         headers = self._build_headers()
         ids_param = ",".join(file_ids)
 
-        for _ in range(20):
+        for attempt in range(len(_FILE_READY_BACKOFF) + 1):
             resp = await client.get(
                 url, headers=headers, params={"file_ids": ids_param}
             )
@@ -184,7 +223,8 @@ class DeepSeekClient:
                     break
             if all_ready:
                 return files
-            await asyncio.sleep(0.5)
+            if attempt < len(_FILE_READY_BACKOFF):
+                await asyncio.sleep(_FILE_READY_BACKOFF[attempt])
 
         return files
 

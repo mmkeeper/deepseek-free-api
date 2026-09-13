@@ -63,7 +63,7 @@ python server.py --port 18632 --host 127.0.0.1 --proxy socks5://127.0.0.1:9150 -
 
 ```json
 {
-  "model": "deepseek-chat",
+  "model": "dsf-deepseek-flash",
   "messages": [...],
   "thinking_enabled": true,
   "search_enabled": true
@@ -72,8 +72,8 @@ python server.py --port 18632 --host 127.0.0.1 --proxy socks5://127.0.0.1:9150 -
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
-| `thinking_enabled` | `true` | Глубокое мышление (.chain-of-thought). Работает с `deepseek-reasoner` / `deepseek-r1` |
-| `search_enabled` | `true` | Поиск в интернете. Работает с `deepseek-chat` |
+| `thinking_enabled` | `true` | Глубокое мышление (.chain-of-thought). Работает с `deepseek-flash` |
+| `search_enabled` | `true` | Поиск в интернете. Работает с `deepseek-flash` |
 
 ### 2. Получить сессию DeepSeek (выбери один способ)
 
@@ -149,7 +149,7 @@ SOCKS5_PROXY=127.0.0.1:9150 python server.py
 В `~/.config/opencode.yaml` или `opencode.json`:
 
 ```yaml
-model: deepseek-chat
+model: dsf-deepseek-flash
 provider:
   id: deepseek-free
   url: http://localhost:18632/v1
@@ -159,14 +159,14 @@ provider:
 Или через `opencode` CLI:
 
 ```bash
-opencode model set deepseek-chat
+opencode model set dsf-deepseek-flash
 opencode provider set http://localhost:18632/v1 --key sk-dummy
 ```
 
 ### Cursor
 
 Settings → Models → Add Custom Model:
-- **Name:** `deepseek-chat`
+- **Name:** `dsf-deepseek-flash`
 - **Endpoint:** `http://localhost:18632/v1`
 - **Key:** любой (например `sk-dummy`)
 
@@ -177,7 +177,7 @@ Settings → Models → Add Custom Model:
   "models": [{
     "title": "DeepSeek Free",
     "provider": "openai",
-    "model": "deepseek-chat",
+    "model": "dsf-deepseek-flash",
     "apiBase": "http://localhost:18632/v1",
     "apiKey": "sk-dummy"
   }]
@@ -187,7 +187,7 @@ Settings → Models → Add Custom Model:
 ### Aider
 
 ```bash
-aider --model openai/deepseek-chat --openai-api-base http://localhost:18632/v1 --openai-api-key sk-dummy
+aider --model openai/dsf-deepseek-flash --openai-api-base http://localhost:18632/v1 --openai-api-key sk-dummy
 ```
 
 ### Claude Code
@@ -203,20 +203,25 @@ claude
 ```bash
 curl http://localhost:18632/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"dsf-deepseek-chat","messages":[{"role":"user","content":"Привет! Как дела?"}],"stream":false}'
+  -d '{"model":"dsf-deepseek-flash","messages":[{"role":"user","content":"Привет! Как дела?"}],"stream":false}'
 ```
 
 ---
 
 ## Модели
 
-| ID | Описание | Работает с прокси | Работает без прокси |
-|---|---|---|---|
-| `dsf-deepseek-chat` | DeepSeek V3 / V4 (обычный чат) | ✅ | ✅ |
-| `dsf-deepseek-reasoner` | DeepSeek R1 (с рассуждением) | ✅ | ✅ |
-| `dsf-deepseek-vision` | DeepSeek Vision (анализ изображений) | ⚠️ требует загрузку файлов | ✅ |
+Единая модель `dsf-deepseek-flash` (DeepSeek-V4.1-Flash) объединяет все режимы:
+глубокое мышление, анализ изображений и поиск в интернете. Режим выбирается
+автоматически по содержимому запроса.
+
+| ID | Описание | Работает с прокси |
+|---|---|---|
+| `dsf-deepseek-flash` | DeepSeek-V4.1-Flash (единая модель: чат + глубокое мышление + изображения + поиск) | ✅ |
 
 > Префикс `dsf-` используется для совместимости с другими провайдерами в инструментах вроде Hermes. Префикс автоматически снимается перед отправкой в upstream.
+
+> Старые имена `dsf-deepseek-chat`, `dsf-deepseek-reasoner`, `dsf-deepseek-vision`
+> продолжают работать как обратно совместимые алиасы на ту же модель.
 
 > Для работы через SOCKS5 прокси нужно установить: `pip install "httpx[socks]"`
 
@@ -261,7 +266,6 @@ python server.py
 ## Ограничения
 
 - DeepSeek имеет лимиты на количество запросов с одной сессии (~20-30 в минуту)
-- Не все фичи DeepSeek API доступны через веб-формат (поиск, файлы)
 - Сессию нужно периодически обновлять (раз в несколько дней)
 
 ## llama-swap integration
@@ -276,13 +280,11 @@ python server.py
 
 **Стриминг (`stream: true`):**
 - Thinking чанки: поле `reasoning_content` в `delta` объекте
-- Также отправляются `<think>` / `</think>` теги в `content` для обратной совместимости
+- Текст ответа: поле `content` в `delta` объекте
 
 ```json
 {"choices": [{"delta": {"reasoning_content": "Анализирую вопрос...", "role": "assistant"}}]}
-{"choices": [{"delta": {"content": "<think>", "role": "assistant"}}]}
 {"choices": [{"delta": {"reasoning_content": "Пользователь спрашивает...", "role": "assistant"}}]}
-{"choices": [{"delta": {"content": "</think>", "role": "assistant"}}]}
 {"choices": [{"delta": {"content": "Ответ пользователя", "role": "assistant"}}]}
 ```
 
@@ -300,6 +302,39 @@ python server.py
 ### Совместимость
 
 Протестировано с:
-- **Hermes** (агент) — thinking отображается через `reasoning_content` и `<think>` теги
+- **Hermes** (агент) — thinking отображается через `reasoning_content`
 - **OpenCode** — thinking в content
 - **curl** — оба формата доступны
+
+_Примечание:_ раньше при переходе от thinking к text отправлялись литеральные
+маркеры ` thinking`/` response` в `content`. Они накапливались клиентом в тексте
+ассистента и попадали в саммари новых сессий, поэтому убраны — рассуждения
+передаются только через `reasoning_content`.
+
+## Изображения и файлы
+
+Единая модель анализирует изображения и прикреплённые файлы (xlsx, xml, pdf
+и др.) автоматически. Изображения передаются в сообщениях как `image_url`
+части, файлы — как `file`/`input_file` части с data URL (или http URL) и
+загружаются в DeepSeek перед отправкой:
+
+```json
+{
+  "model": "dsf-deepseek-flash",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Что на этой картинке?"},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR..."}},
+      {"type": "file", "file": {"filename": "cell.xlsx", "file_data": "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,UEs..."}}
+    ]
+  }]
+}
+```
+
+Также поддерживается старый формат `{"type": "input_file", "filename": "a.pdf",
+"file_data": "data:application/pdf;base64,..."}` и data URL с параметром `;name=файл.ext;base64`.
+
+Файлы попадают в запрос через `ref_file_ids`. Если загрузка невозможна (нет прав
+на файлы в веб-формате или формат не поддерживается), запрос продолжается без
+файла, в текст вставляется маркер `[изображение]`/`[файл: имя]`.

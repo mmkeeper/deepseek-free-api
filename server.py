@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import sys
@@ -40,7 +43,7 @@ from src.auth import (
 from src.client import AuthError, DeepSeekClient
 from src.sse import DeepSeekError
 from src.config import BASE_URL
-from src.proxy import get_proxy_info
+from src.proxy import get_http_client, get_proxy_info
 
 
 # ─── Config ───────────────────────────────────────────────
@@ -136,6 +139,170 @@ def create_client() -> DeepSeekClient:
         token=auth["token"],
         debug=DEBUG or logging.getLogger().isEnabledFor(logging.DEBUG),
     )
+
+
+# ─── Attachment handling (единая модель: изображения и файлы) ───────────
+
+# mimetypes.guess_extension() has surprising mappings for common types
+# (e.g. application/xml → .xsl), override them here.
+_MIME_EXT_OVERRIDES = {
+    "application/xml": ".xml",
+    "text/xml": ".xml",
+    "application/octet-stream": ".bin",
+}
+
+
+def _guess_ext(mime: str, fallback: str) -> str:
+    mime = mime.strip().lower()
+    if mime in _MIME_EXT_OVERRIDES:
+        return _MIME_EXT_OVERRIDES[mime]
+    return mimetypes.guess_extension(mime) or fallback
+
+
+def _image_ext(url: str, content_type: str = "") -> str:
+    if url.startswith("data:"):
+        mime = url[5:].split(";", 1)[0]
+        return _guess_ext(mime, ".png")
+    ext = _guess_ext(content_type.split(";")[0], "")
+    if not ext:
+        path = url.split("?")[0].rsplit(".", 1)[-1]
+        ext = "." + path if path and "/" not in path else ".png"
+    return ext
+
+
+def _mime_ext(url: str, content_type: str = "") -> str:
+    """Extension from a data: URL mime or http content-type (default .bin)."""
+    if url.startswith("data:"):
+        mime = url[5:].split(";", 1)[0]
+        return _guess_ext(mime, ".bin")
+    ext = _guess_ext(content_type.split(";")[0], "")
+    if not ext:
+        path = url.split("?")[0].rsplit(".", 1)[-1]
+        ext = "." + path if path and "/" not in path else ".bin"
+    return ext
+
+
+def _sanitize_filename(name: str) -> str:
+    """Return a safe basename: path components stripped, control chars removed."""
+    if not name:
+        return ""
+    name = name.replace("\\", "/").split("/")[-1].strip()
+    name = "".join(ch for ch in name if 32 <= ord(ch) <= 126 or ord(ch) > 126)
+    return name[:255]
+
+
+def _attachment_filename(item: dict) -> str:
+    """Best-effort client-provided filename for a file/input_file content part."""
+    f = item.get("file") if item.get("type") == "file" else item.get("input_file")
+    if isinstance(f, dict):
+        return f.get("filename") or item.get("filename") or ""
+    return item.get("filename") or ""
+
+
+async def _extract_attachments(messages: list[dict]) -> list[tuple[str, bytes, bool]]:
+    """Extract attachment parts from the last message: images and files.
+
+    Supported content part shapes (OpenAI-compatible):
+      * {"type": "image_url", "image_url": {"url": "data:...|http..."}}
+      * {"type": "image", "url": "data:...|http..."}
+      * {"type": "file", "file": {"filename": "a.xlsx", "file_data": "data:..."}}
+      * {"type": "input_file", "filename": "a.xlsx", "file_data": "data:..."}
+      * {"type": "file", "file": "data:..."}
+
+    Returns (filename, data, is_image) triples. Images without an explicit
+    name fall back to image<ext> so DeepSeek renders them as pictures; other
+    files fall back to file<ext>.
+    """
+    if not messages:
+        return []
+    c = messages[-1].get("content")
+    if not isinstance(c, list):
+        return []
+    attachments = []
+    client = get_http_client()
+    for item in c:
+        itype = item.get("type")
+        if itype in ("image_url", "image"):
+            is_image = True
+            url = item.get("image_url") or item.get("url") or ""
+            if isinstance(url, dict):
+                url = url.get("url") or ""
+            filename = _sanitize_filename(item.get("filename") or "")
+        elif itype in ("file", "input_file"):
+            is_image = False
+            f = item.get("file") if itype == "file" else item.get("input_file")
+            if isinstance(f, str):
+                f = {"file_data": f}
+            f = f or {}
+            if isinstance(f, dict):
+                filename = _sanitize_filename(_attachment_filename(item))
+                url = f.get("file_data") or f.get("data") or item.get("file_data") or item.get("data") or ""
+            else:
+                filename, url = "", ""
+        else:
+            continue
+
+        if url.startswith("data:"):
+            try:
+                header, b64 = url.split(",", 1)
+                data = base64.b64decode(b64)
+            except (ValueError, binascii.Error):
+                log.debug(f"Bad data URL attachment skipped")
+                continue
+            if not filename:
+                m = re.search(r";name=([^;,]+)", header)
+                if m:
+                    filename = _sanitize_filename(m.group(1))
+            if not filename:
+                ext = _image_ext(url) if is_image else _mime_ext(url)
+                filename = f"image{ext}" if is_image else f"file{ext}"
+            attachments.append((filename, data, is_image))
+        elif url.startswith("http://") or url.startswith("https://"):
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.content
+            except Exception as e:
+                log.debug(f"Failed to fetch attachment {url[:80]}: {e}")
+                continue
+            if not filename:
+                ext = _image_ext(url, resp.headers.get("content-type", "")) if is_image else _mime_ext(url, resp.headers.get("content-type", ""))
+                filename = f"image{ext}" if is_image else f"file{ext}"
+            attachments.append((filename, data, is_image))
+    return attachments
+
+
+async def _upload_attachments(client: DeepSeekClient, attachments: list[tuple[str, bytes, bool]],
+                              model_type: str, thinking_enabled: bool,
+                              req_id: str) -> tuple[list[str], str]:
+    """Upload attachments, waiting for each to become ready. Returns (file_ids, used_type).
+
+    The unified model may advertise upload limits under any of the legacy
+    model_type keys, so fall back until one works.
+    """
+    candidates = [model_type]
+    for alt in ("vision", "default", "expert"):
+        if alt not in candidates:
+            candidates.append(alt)
+    used_type = model_type
+    ref_file_ids = []
+    for filename, data, _is_image in attachments:
+        last_err = None
+        for mt in candidates:
+            try:
+                fid = await client.upload_and_confirm(filename, data, model_type=mt,
+                                                      thinking_enabled=thinking_enabled, req_id=req_id)
+                ref_file_ids.append(fid)
+                if used_type != mt:
+                    used_type = mt
+                rlog(req_id, f"ATTACHMENT UPLOADED & CONFIRMED: {filename} → {fid} (model_type={mt})")
+                break
+            except Exception as e:
+                last_err = e
+                rlog(req_id, f"ATTACHMENT UPLOAD try {mt} failed: {e}")
+        else:
+            rlog(req_id, f"ATTACHMENT UPLOAD FAILED: {filename}: {last_err}")
+    return ref_file_ids, used_type
 
 
 # ─── Session store (reuse DeepSeek sessions within one server run) ───
@@ -388,14 +555,17 @@ def _prefix_key(messages: list[dict]) -> str:
     Tool result messages (both role=tool and user role preceded by assistant
     with tool_calls) are excluded so the key stays stable across retries.
 
-    Returns empty string if there are fewer than 2 user/system messages in
-    the prefix, preventing different conversations with the same system prompt
-    from colliding on the same DeepSeek session.
+    Returns empty string only if there are no user/system messages in the
+    prefix (i.e. a first turn). A single user message in the prefix is a valid
+    continuation key for the second turn — it must match the first turn's nkey,
+    otherwise every second message would start a new DeepSeek session.
+    Storage keys (nkeys) always include at least one user message, so a
+    system-only prefix can never collide with a stored key.
     """
     prefix = messages[:-1] if len(messages) >= 1 else []
     stable = _strip_tool_results(prefix)
     umsgs = _user_messages(stable)
-    if len(umsgs) < 2:
+    if not umsgs:
         return ""
     return _hash_messages(umsgs)
 
@@ -511,6 +681,13 @@ def _first_paragraph(desc: str) -> str:
     return parts[0].rstrip()
 
 
+def _strip_assistant_preamble(content: str) -> str:
+    """Убирает остаточный служебный префикс " thinking/response", попавший в
+    текст ассистента (старые версии прокси эмитили его как content-чанки).
+    Если размышления вырезаются — вместе с тегами."""
+    return re.sub(r'^\s*thinking\s*response\s*', '', content, count=1)
+
+
 def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
     parts = []
     if tools:
@@ -552,6 +729,12 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
     lt = chr(60)
     gt = chr(62)
     dq = chr(34)
+    # Префиксы System:/User:/Assistant: нужны только для отделения сообщений
+    # от системного промпта. Если системного промпта нет — отправляем чистый
+    # текст, чтобы первое сообщение на сайте выглядело естественно.
+    has_system = any(m.get("role") == "system" for m in messages)
+    user_pfx = "User: " if has_system else ""
+    assistant_pfx = "Assistant: " if has_system else ""
     for i, m in enumerate(messages):
         role = m.get("role", "")
         c = m.get("content")
@@ -559,28 +742,35 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
             content = c
         elif isinstance(c, list):
             texts = []
-            has_images = False
+            has_attachments = False
             for item in c:
                 if item.get("type") == "text":
                     texts.append(item.get("text", ""))
-                elif item.get("type") == "image_url":
-                    has_images = True
+                elif item.get("type") in ("image_url", "image"):
+                    has_attachments = True
+                    # Картинки/файлы уходят через ref_file_ids, в текст ставим маркер
+                    texts.append("[изображение]")
+                elif item.get("type") in ("file", "input_file"):
+                    has_attachments = True
+                    fname = _sanitize_filename(_attachment_filename(item))
+                    texts.append(f"[файл: {fname}]" if fname else "[файл]")
             content = "\n".join(texts)
-            if has_images:
-                log.debug(f"WARNING: Image content in messages_to_prompt - images not supported")
+            if has_attachments:
+                log.debug(f"File markers inserted in messages_to_prompt; files go via ref_file_ids")
         else:
             content = ""
         content = _truncate_content(_pretty_json(content))
         if role == "tool":
             tc_id = m.get("tool_call_id", "unknown")
-            parts.append(f"User: {lt}tool_result id={dq}{tc_id}{dq}{gt}\n{content}\n{lt}/tool_result{gt}")
+            parts.append(f"{user_pfx}{lt}tool_result id={dq}{tc_id}{dq}{gt}\n{content}\n{lt}/tool_result{gt}")
         elif role == "assistant":
             tc_xml = _tool_calls_to_xml(m.get("tool_calls"))
             if content and tc_xml:
                 content = content + "\n" + tc_xml
             elif tc_xml:
                 content = tc_xml
-            parts.append(f"Assistant: {content}")
+            content = _strip_assistant_preamble(content)
+            parts.append(f"{assistant_pfx}{content}")
         elif role == "system":
             parts.append(f"System: {content}")
         elif role == "user" and i > 0:
@@ -588,12 +778,14 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
             prev = messages[i - 1]
             if prev.get("role") == "assistant" and prev.get("tool_calls"):
                 tc_id = m.get("tool_call_id", "unknown")
-                parts.append(f"User: {lt}tool_result id={dq}{tc_id}{dq}{gt}\n{content}\n{lt}/tool_result{gt}")
+                parts.append(f"{user_pfx}{lt}tool_result id={dq}{tc_id}{dq}{gt}\n{content}\n{lt}/tool_result{gt}")
             else:
-                parts.append(f"User: {content}")
+                parts.append(f"{user_pfx}{content}")
         else:
-            parts.append(f"User: {content}")
-    return "\n\n".join(parts) + "\n\nAssistant:"
+            parts.append(f"{user_pfx}{content}")
+    if has_system:
+        return "\n\n".join(parts) + "\n\nAssistant:"
+    return "\n\n".join(parts)
 
 
 def openai_chunk(chunk_id: str, created: int, model: str, content: str, finish_reason: str | None = None, reasoning_content: str | None = None) -> str:
@@ -935,7 +1127,7 @@ def _build_cached_tool_call_response(chunk_id: str, created: int, model: str, to
 async def handle_completion(body: dict, req_id: str) -> dict:
     messages = body.get("messages", [])
     stream = body.get("stream", False)
-    model = strip_prefix(body.get("model", "deepseek-chat"))
+    model = strip_prefix(body.get("model", "deepseek-flash"))
     tools = body.get("tools")
 
     rlog(req_id, f"=" * 60)
@@ -943,6 +1135,9 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     rlog(req_id, f"Raw body: {json.dumps(body, ensure_ascii=False)}")
 
     model_lower = (model or "").lower()
+    # Единая модель deepseek-flash: режим (быстрый/expert/vision) больше не
+    # выбирается именем модели. Имена legacy-псевдонимов сохраняются для
+    # обратной совместимости, но тип берётся из контента запроса.
     model_type = "default"
     if "reasoner" in model_lower or "r1" in model_lower:
         model_type = "expert"
@@ -950,20 +1145,29 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         model_type = "vision"
 
     # reasoning_effort от Hermes: none/minimal/low/medium/high/xhigh/max/ultra/show/hide
-    # Перебивается флагом --no-thinking
+    # Перебивается флагом --no-thinking. В единой модели глубокое мышление
+    # включено по умолчанию — выключается только явным "none"/"hide" или
+    # thinking_enabled=false.
     if not default_thinking:
         thinking_enabled = False
     else:
-        reasoning_effort = body.get("reasoning_effort", "")
-        if reasoning_effort in ("high", "xhigh", "max", "ultra", "show"):
-            thinking_enabled = True
-        elif reasoning_effort in ("", "none", "minimal", "low", "medium", "hide"):
+        reasoning_effort = (body.get("reasoning_effort") or "").lower()
+        if reasoning_effort in ("none", "off", "hide", "minimal"):
             thinking_enabled = False
         else:
-            thinking_enabled = body.get("thinking_enabled", default_thinking)
+            thinking_enabled = body.get("thinking_enabled", True)
     search_enabled = body.get("search_enabled", default_search)
 
     client = create_client()
+
+    # ── Анализ вложений: единая модель сама определяет наличие картинок/файлов ──
+    attachments = await _extract_attachments(messages)
+    ref_file_ids: list[str] = []
+    if any(is_image for _, _, is_image in attachments):
+        model_type = "vision"
+        rlog(req_id, f"IMAGES DETECTED: {len(attachments)} — switching model_type to vision")
+    elif attachments:
+        rlog(req_id, f"FILES DETECTED: {len(attachments)} — {[f for f, _, _ in attachments]}")
 
     chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
@@ -981,12 +1185,14 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         last_content = c
     elif isinstance(c, list):
         texts = []
-        has_images = False
         for item in c:
             if item.get("type") == "text":
                 texts.append(item.get("text", ""))
             elif item.get("type") in ("image_url", "image"):
-                has_images = True
+                texts.append("[изображение]")
+            elif item.get("type") in ("file", "input_file"):
+                fname = _sanitize_filename(_attachment_filename(item))
+                texts.append(f"[файл: {fname}]" if fname else "[файл]")
         last_content = "\n".join(texts)
 
     session_id: str
@@ -1156,6 +1362,13 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     rlog(req_id, f"← PROXY → DEEPSEEK  session={session_id} parent={parent_message_id}")
     rlog(req_id, f"PROMPT ({len(prompt)} chars):\n{prompt}")
 
+    # ── Upload attached images/files after session resolution ──────
+    if attachments:
+        ref_file_ids, used_type = await _upload_attachments(client, attachments, model_type, thinking_enabled, req_id)
+        if ref_file_ids:
+            model_type = used_type
+            rlog(req_id, f"REF_FILE_IDS: {ref_file_ids} model_type={model_type}")
+
     # ── Streaming ────────────────────────────────────────────
     if stream:
         # Shared with handle_chat: current DeepSeek message_id so the proxy can
@@ -1175,7 +1388,6 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 })
                 on_chunk(f"data: {payload}\n\n")
 
-                thinking_opened = False
                 full_text = ""
                 think_text = ""        # accumulated thinking content
                 text_buf = ""          # text to send as content
@@ -1183,19 +1395,16 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 tool_text_buf = ""     # accumulated tool call XML
 
                 def on_thinking_chunk(text: str):
-                    nonlocal thinking_opened, think_text
+                    nonlocal think_text
                     think_text += text
-                    if not thinking_opened:
-                        on_chunk(openai_chunk(chunk_id, created, model, "<think>", None))
-                        thinking_opened = True
+                    # Reasoning уходит только через reasoning_content. Литеральные
+                    # маркеры в content ("  thinking"/" response") не шлём — они
+                    # собирались клиентом в текст ассистента и попадали в саммари.
                     on_chunk(openai_chunk(chunk_id, created, model, "", None, reasoning_content=text))
 
                 def on_text_chunk(text: str):
-                    nonlocal thinking_opened, full_text, text_buf, in_tool_call, tool_text_buf
+                    nonlocal full_text, text_buf, in_tool_call, tool_text_buf
                     full_text += text
-                    if thinking_opened:
-                        on_chunk(openai_chunk(chunk_id, created, model, "</think>", None))
-                        thinking_opened = False
 
                     if in_tool_call:
                         tool_text_buf += text
@@ -1228,14 +1437,12 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     parent_message_id=parent_message_id,
                     thinking_enabled=thinking_enabled,
                     search_enabled=search_enabled,
+                    ref_file_ids=ref_file_ids,
                     req_id=req_id,
                     on_text=on_text_chunk,
                     on_thinking=on_thinking_chunk,
                     on_message_id=on_message_id_chunk,
                 )
-
-                if thinking_opened:
-                    on_chunk(openai_chunk(chunk_id, created, model, "</think>", None))
 
                 # ── LOG: DeepSeek raw response
                 rlog(req_id, f"DEEPSEEK RESPONSE ({len(full_text)} chars text + {len(think_text)} chars think):\n{full_text}")
@@ -1343,6 +1550,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         parent_message_id=parent_message_id,
         thinking_enabled=thinking_enabled,
         search_enabled=search_enabled,
+        ref_file_ids=ref_file_ids,
         req_id=req_id,
         on_text=on_text,
         on_thinking=on_thinking,
@@ -1390,6 +1598,8 @@ async def handle_options(request: web.Request) -> web.Response:
 async def handle_models(request: web.Request) -> web.Response:
     now = int(time.time() * 1000)
     models = [
+        {"id": f"{PREFIX}deepseek-flash", "object": "model", "created": now, "owned_by": "deepseek"},
+        # Обратная совместимость: старые имена перенаправляются на ту же модель
         {"id": f"{PREFIX}deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek"},
         {"id": f"{PREFIX}deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
         {"id": f"{PREFIX}deepseek-vision", "object": "model", "created": now, "owned_by": "deepseek"},
