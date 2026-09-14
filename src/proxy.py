@@ -22,7 +22,11 @@ def get_http_client():
 
     proxy = get_socks5_proxy()
     proxy_url = _normalize_url(proxy) if proxy else None
-    _client = httpx.AsyncClient(proxy=proxy_url, timeout=60, follow_redirects=True)
+    _client = httpx.AsyncClient(
+        proxy=proxy_url,
+        timeout=httpx.Timeout(connect=60, read=None, write=60, pool=60),
+        follow_redirects=True,
+    )
     return _client
 
 

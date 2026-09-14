@@ -421,6 +421,214 @@ def test_no_tool_call_in_plain_text():
     print("  PASS: plain text -> no tool calls")
 
 
+def test_usr_format_parses():
+    """Новый usr_-префиксный формат (актуальный tool_header)."""
+    text = """<usr_tool_calls>
+  <usr_tool_call name="web_search">
+    <usr_parameter name="query">погода в санкт-петербурге</usr_parameter>
+    <usr_parameter name="limit">5</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 1, f"expected 1 tool call, got {tcs}"
+    assert tcs[0]["name"] == "web_search", tcs
+    assert json.loads(tcs[0]["arguments"]) == {"query": "погода в санкт-петербурге", "limit": "5"}
+    print("  PASS: usr_ format single call")
+
+
+def test_usr_format_multiple_calls():
+    text = """<usr_tool_calls>
+  <usr_tool_call name="read_file">
+    <usr_parameter name="path">C:\\x.txt</usr_parameter>
+  </usr_tool_call>
+  <usr_tool_call name="web_search">
+    <usr_parameter name="query">hello</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 2, f"expected 2 tool calls, got {tcs}"
+    assert [t["name"] for t in tcs] == ["read_file", "web_search"]
+    assert json.loads(tcs[0]["arguments"]) == {"path": "C:\\x.txt"}
+    print("  PASS: usr_ format multiple calls")
+
+
+def test_usr_format_no_wrapper():
+    """Без <usr_tool_calls>-обёртки тоже парсится (как старый Format 9)."""
+    text = """<usr_tool_call name="terminal">
+  <usr_parameter name="command">ls -la</usr_parameter>
+</usr_tool_call>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 1 and tcs[0]["name"] == "terminal", tcs
+    assert json.loads(tcs[0]["arguments"]) == {"command": "ls -la"}
+    print("  PASS: usr_ format without wrapper")
+
+
+def test_usr_format_zero_args():
+    tcs = parse_tool_calls("<usr_tool_calls>\n<usr_tool_call name=\"skills_list\">\n\n</usr_tool_call>\n</usr_tool_calls>")
+    assert len(tcs) == 1 and tcs[0]["name"] == "skills_list", tcs
+    assert json.loads(tcs[0]["arguments"]) == {}
+    print("  PASS: usr_ zero-argument call")
+
+
+def test_usr_format_in_token_tool_header_rendered():
+    """_tool_calls_to_xml рендерит историю tool_calls в usr_ формате."""
+    from server import _tool_calls_to_xml
+    xml = _tool_calls_to_xml([{
+        "id": "call_1", "type": "function",
+        "function": {"name": "web_search", "arguments": json.dumps({"query": "t", "limit": 3})}
+    }])
+    assert '<usr_tool_call name="web_search">' in xml, xml
+    assert '<usr_parameter name="query">t</usr_parameter>' in xml, xml
+    assert '</usr_parameter>' in xml and '</usr_tool_call>' in xml
+    print("  PASS: _tool_calls_to_xml emits usr_ tags")
+
+
+def test_usr_strip_tool_tags():
+    """_strip_tool_tags вырезает usr_ теги вне код-блоков, внутри - сохраняет."""
+    text = """до <usr_tool_call name="x"><usr_parameter name="p">1</usr_parameter></usr_tool_call> после
+```
+<usr_tool_calls>
+  <usr_tool_call name="y"/>
+</usr_tool_calls>
+```"""
+    out = _strip_tool_tags(text)
+    assert '<usr_tool_call name="x">' not in out, out
+    assert '<usr_tool_call name="y"/>' in out, "fenced usr_ markup must survive"
+    print("  PASS: _strip_tool_tags handles usr_ tags")
+
+
+def test_usr_format_in_fence_defused():
+    """Пример usr_ формата внутри ```-блока — не реальный вызов (mask on)."""
+    server.MASK_CODE_FENCES = True
+    try:
+        text = """Вот формат:
+
+```
+<usr_tool_calls>
+  <usr_tool_call name="web_search">
+    <usr_parameter name="query">пример</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>
+```
+"""
+        tcs = parse_tool_calls(text)
+        assert tcs == [], f"expected no tool calls, got {tcs}"
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: usr_ example inside fence ignored (mask on)")
+
+
+def test_usr_inline_mention_defused():
+    """Инлайн-упоминание `<usr_tool_call ...>` не даёт фантомного вызова."""
+    server.MASK_CODE_FENCES = True
+    try:
+        tcs = parse_tool_calls("Оберните вызов в `<usr_tool_calls>` и `<usr_tool_call name=\"x\">`.")
+        assert tcs == [], tcs
+        msg = ("Пример: `<usr_tool_call name=\"fake\"><usr_parameter name=\"p\">v</usr_parameter></usr_tool_call>`.\n\n"
+               "<usr_tool_call name=\"skills_list\"></usr_tool_call>")
+        tcs = parse_tool_calls(msg)
+        assert len(tcs) == 1 and tcs[0]["name"] == "skills_list", tcs
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: usr_ inline mentions no phantoms, real call intact")
+
+
+def test_fix_tool_desc_rewrites_format_mentions():
+    from server import _fix_tool_desc
+    assert _fix_tool_desc("respond with <tool_call name='x'>") == "respond with <usr_tool_call name='x'>"
+    assert _fix_tool_desc("wrap the call in <tool_calls>") == "wrap the call in <usr_tool_calls>"
+    assert _fix_tool_desc("no tags here") == "no tags here"
+    assert _fix_tool_desc("") == ""
+    print("  PASS: _fix_tool_desc rewrites tool_call -> usr_tool_call")
+
+
+def test_messages_to_prompt_rewrites_tool_descriptions():
+    """Описания тулов от клиента с 'tool_call' не противоречат usr_ формату."""
+    from server import messages_to_prompt
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Call <tool_call name=\"web_search\"> to search the web.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string", "description": "query; use tool_call as described"}
+                },
+                "required": ["q"],
+            },
+        },
+    }]
+    out = messages_to_prompt(
+        [{"role": "system", "content": ""}, {"role": "user", "content": "hi"}],
+        tools,
+    )
+    assert "<usr_tool_call name=\"web_search\">" in out, out
+    assert "use usr_tool_call as described" in out, out
+    assert "<tool_call" not in out, "no raw tool_call mentions may remain"
+    print("  PASS: messages_to_prompt shows tool descriptions in usr_ format")
+
+
+def test_messages_to_prompt_skips_tool_call():
+    """Инструмент `tool_call` (формат-обманка) не печатается в списке тулов."""
+    from server import messages_to_prompt
+    tools = [
+        {"type": "function", "function": {
+            "name": "web_search", "description": "search the web.",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {
+            "name": "tool_call", "description": "ensure you use <tool_call name='x'>",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {
+            "name": "memory", "description": "remember something",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {
+            "name": "some_plugin_tool", "description": "does stuff",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+    ]
+    out = messages_to_prompt(
+        [{"role": "system", "content": ""}, {"role": "user", "content": "hi"}],
+        tools,
+    )
+    assert "tool_call [deferred]" not in out, out
+    assert "ensure you use" not in out, "description of tool_call must not be printed"
+    assert "web_search" in out
+    assert "memory" in out
+    assert "some_plugin_tool" in out
+    assert "  - some_plugin_tool: does stuff\n    params: " in out, "all tools show full parameter schemas"
+    print("  PASS: tool_call excluded from the tool list")
+
+
+def test_spaced_tags_parsed():
+    """deepseek-flash теперь шлёт теги с пробелом после '<' — вызов должен распознаваться."""
+    text = """< calls>
+< invoke name="skill_view">
+< parameter name="name" string="true">local-firecrawl-setup</ parameter>
+</ invoke>
+</ calls>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
+    assert tcs[0]["name"] == "skill_view", f"bogus name: {tcs}"
+    args = json.loads(tcs[0]["arguments"])
+    assert args == {"name": "local-firecrawl-setup"}, f"bad args: {args}"
+    print("  PASS: spaced tags parsed")
+
+
+def test_spaced_tags_stripped_from_client_text():
+    """Те же теги с пробелами не должны утекать в текст ответа."""
+    text = """Начинаю.
+
+< calls>
+< invoke name="skill_view">
+< parameter name="name" string="true">local-firecrawl-setup</ parameter>
+</ invoke>
+</ calls>"""
+    out = _strip_tool_tags(text)
+    assert "<" not in out or "calls" not in out, f"tool markup leaked: {out!r}"
+    assert "Начинаю." in out
+    print("  PASS: spaced tags stripped from client text")
+
+
 if __name__ == "__main__":
     tests = [
         test_nested_quadruple_fence_defused,
@@ -447,6 +655,19 @@ if __name__ == "__main__":
         test_regression_hermes_format9,
         test_regression_invoke_format1,
         test_no_tool_call_in_plain_text,
+        test_usr_format_parses,
+        test_usr_format_multiple_calls,
+        test_usr_format_no_wrapper,
+        test_usr_format_zero_args,
+        test_usr_format_in_token_tool_header_rendered,
+        test_usr_strip_tool_tags,
+        test_usr_format_in_fence_defused,
+        test_usr_inline_mention_defused,
+        test_fix_tool_desc_rewrites_format_mentions,
+        test_messages_to_prompt_rewrites_tool_descriptions,
+        test_messages_to_prompt_skips_tool_call,
+        test_spaced_tags_parsed,
+        test_spaced_tags_stripped_from_client_text,
     ]
     for t in tests:
         try:

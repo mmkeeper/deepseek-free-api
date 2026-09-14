@@ -31,6 +31,46 @@ DEBUG = False  # Переключи в True для отладки или исп�
 
 MAX_TOOL_RESULT_CHARS = 50000  # Truncate tool output to avoid DeepSeek prompt length limits
 
+lt, gt = chr(60), chr(62)
+dq = chr(34)
+tc_open = lt + "usr_tool_calls" + gt
+tc_close = lt + "/usr_tool_calls" + gt
+
+tool_coll_header = "To call a tool, respond with:" + chr(10)
+tool_coll_header += tc_open + chr(10)
+tool_coll_header += "  " + lt + "usr_tool_call" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
+tool_coll_header += "    " + lt + "usr_parameter" + " name=" + dq + "PARAM_NAME" + dq + gt + "VALUE" + lt + "/usr_parameter" + gt + chr(
+    10)
+tool_coll_header += "  " + lt + "/usr_tool_call" + gt + chr(10)
+tool_coll_header += tc_close + chr(10) + chr(10)
+tool_coll_header += "ПЕРЕД ВЫЗОВОМ ЛЮБОГО ИНСТРУМЕНТА — трёхшаговый протокол. Шаги нельзя пропускать, сливать или менять местами." + chr(
+    10)
+tool_coll_header += chr(10)
+tool_coll_header += "Шаг 1. Черновик." + chr(10)
+tool_coll_header += "В блоке размышлений выведи предполагаемый XML вызова целиком — в блоке:" + chr(10)
+tool_coll_header += "```xml" + chr(10)
+tool_coll_header += "XML" + chr(10)
+tool_coll_header += "```" + chr(10)
+tool_coll_header += "Сырой, неэкранированный XML вызова в размышлениях писать запрещено." + chr(10)
+tool_coll_header += chr(10)
+tool_coll_header += "Шаг 2. Проверка." + chr(10)
+tool_coll_header += "Сравни черновик с эталонным форматом (приведён выше) по каждому пункту:" + chr(10)
+tool_coll_header += "  — открывающий тег ровно <usr_tool_calls>;" + chr(10)
+tool_coll_header += "  — тег вызова ровно <usr_tool_call name=\"ИМЯ_ИНСТРУМЕНТА\">;" + chr(10)
+tool_coll_header += "  — каждый параметр ровно <usr_parameter name=\"ИМЯ_ПАРАМЕТРА\">ЗНАЧЕНИЕ</usr_parameter>;" + chr(
+    10)
+tool_coll_header += "  — закрывающие теги ровно </usr_tool_call> и </usr_tool_calls>;" + chr(10)
+tool_coll_header += "  — все имена тегов имеют префикс \"usr_\"; синонимы и теги из иных синтаксисов (parameter, invoke, calls, function, tool_call и любые другие) НЕДОПУСТИМЫ;" + chr(
+    10)
+tool_coll_header += "  — угловые скобки парны, вложенность корректна, лишних атрибутов нет." + chr(10)
+tool_coll_header += "Если хотя бы один пункт не выполняется — исправь черновик и проверь заново, прежде чем идти дальше." + chr(
+    10)
+tool_coll_header += chr(10)
+tool_coll_header += "Шаг 3. Вызов. Твой видимый ответ должен быть расположен вне блока размышлений и состоять из проверенного XML" + chr(10)
+tool_coll_header += "Выводи его в СЫРОМ виде, скопировав проверенный XML ПОСИМВОЛЬНО, без единого изменения. Не «оформляй» вызов: не оборачивай в ```-блок, не выделяй кавычками, не добавляй отступов-цитаты. Любая обёртка — это уже другой ответ, и инструмент не исполнится." + chr(10)
+tool_coll_header += "Если в момент генерации возникает вариант с другим именем тега — остановись, вернись к Шагу 1 и повтори цикл." + chr(10)
+
+
 from aiohttp import web
 
 from src.auth import (
@@ -388,7 +428,7 @@ def rlog(req_id: str, msg: str):
 
 # ─── XML tag stripping — keep content clean from tool markup ─
 
-_TOOL_TAG_RE = re.compile(r'</?(?:tool_calls|tool_call|invoke|parameter|name|arguments)[^>]*>')
+_TOOL_TAG_RE = re.compile(r'</?\s*(?:usr_tool_calls|usr_tool_call|usr_parameter|tool_calls|tool_call|invoke|parameter|name|arguments|calls)[^>]*>')
 
 
 def _strip_tool_tags(text: str) -> str:
@@ -420,7 +460,7 @@ _FENCE_RUN_RE = re.compile(r"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})")
 _SPAN_TOKEN_RE = re.compile(r"(`{3,}|`)")
 # Гравис-обёрнутые туловые теги в прозе: `<tool_calls>`, `</tool_call>`,
 # `<parameter name="...">` и т.п. Обезвреживаются точечно, без состояния.
-_SPAN_TOOL_TAG_RE = re.compile(r"`(?:</?(?:tool_calls?|invoke|parameter|name|arguments)\b[^`]*)`")
+_SPAN_TOOL_TAG_RE = re.compile(r"`(?:</?(?:usr_tool_calls?|usr_parameter|tool_calls?|invoke|parameter|name|arguments)\b[^`]*)`")
 
 
 def _walk_outside(seg: str, span_fn, outside_fn) -> str:
@@ -622,7 +662,7 @@ def _pretty_json(text: str) -> str:
 
 
 def _tool_calls_to_xml(tool_calls: list | None) -> str:
-    """Convert OpenAI tool_calls to the taught <tool_call> XML format."""
+    """Convert OpenAI tool_calls to the taught <usr_tool_call> XML format."""
     if not tool_calls:
         return ""
     import json as _json
@@ -638,29 +678,14 @@ def _tool_calls_to_xml(tool_calls: list | None) -> str:
             args = _json.loads(args_str) if isinstance(args_str, str) else args_str
         except (_json.JSONDecodeError, TypeError):
             args = {}
-        lines.append(f"{lt}tool_call name={dq}{name}{dq}{gt}")
+        lines.append(f"{lt}usr_tool_call name={dq}{name}{dq}{gt}")
         for k, v in args.items():
-            lines.append(f"  {lt}parameter name={dq}{k}{dq}{gt}{v}{lt}/parameter{gt}")
-        lines.append(f"{lt}/tool_call{gt}")
+            lines.append(f"  {lt}usr_parameter name={dq}{k}{dq}{gt}{v}{lt}/usr_parameter{gt}")
+        lines.append(f"{lt}/usr_tool_call{gt}")
     return "\n".join(lines)
 
 
 # ─── OpenAI -> DeepSeek conversion ─────────────────────────
-
-# Инструменты, для которых грузим ПОЛНУЮ схему параметров сразу.
-FULL_SCHEMA_TOOLS = {
-    "terminal",
-    "read_file",
-    "write_file",
-    "patch",
-    "search_files",
-    "execute_code",
-    "web_search",
-    "web_extract",
-    "memory",
-    "process",
-    "tool_describe",
-}
 
 
 def _format_full_schema(params: dict) -> str:
@@ -670,18 +695,31 @@ def _format_full_schema(params: dict) -> str:
     return json.dumps(params, ensure_ascii=False, separators=(",", ":"))
 
 
-# Сокращать описания отложенных тулов до первого абзаца (см. _first_paragraph).
-# Сейчас отключено: выводим полные описания, как их передаёт клиент.
-SHORTEN_DEFERRED_DESC = False
+def _fix_tool_desc(text: str) -> str:
+    """Приводит упоминания формата вызова в описаниях тулов к usr_-префиксам.
+
+    Клиентские описания инструментов могут инструктировать отвечать
+    тегами `<tool_call>`. Если их оставить как есть, модель получит два
+    противоречивых формата. Простая замена tool_call -> usr_tool_call
+    (покрывает и tool_calls -> usr_tool_calls, т.к. подстрока).
+    """
+    if not text:
+        return text
+    return text.replace("tool_call", "usr_tool_call")
 
 
-def _first_paragraph(desc: str) -> str:
-    """Описание до первой пустой строки; многоточие, если сокращено."""
-    desc = desc.replace("\r\n", "\n").lstrip()
-    parts = desc.split("\n\n", 1)
-    if len(parts) == 2 and parts[1].strip():
-        return parts[0].rstrip() + "…"
-    return parts[0].rstrip()
+def _normalize_spaced_tags(text: str) -> str:
+    """Сводит "< calls>"/"</ parameter>" к "<calls>"/"</parameter>".
+
+    deepseek-flash оборачивает инструментальные теги пробелом сразу после
+    '<' и после '</'. Без нормализации ни парсер, ни клиент не распознают
+    вызов (tool_calls=0, сырые теги уходят в текст ответа).
+    """
+    if not text:
+        return text
+    text = re.sub(r"</\s+([a-zA-Z_])", r"</\1", text)
+    text = re.sub(r"<\s+([a-zA-Z_])", r"<\1", text)
+    return text
 
 
 def _strip_assistant_preamble(content: str) -> str:
@@ -696,39 +734,26 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
     if tools:
         lt, gt = chr(60), chr(62)
         dq = chr(34)
-        tc_open = lt + "tool_calls" + gt
-        tc_close = lt + "/tool_calls" + gt
+        tc_open = lt + "usr_tool_calls" + gt
+        tc_close = lt + "/usr_tool_calls" + gt
         immediate_descs = []
-        deferred_descs = []
         for t in tools:
             func = t.get("function", {})
             name = func.get("name", "unknown")
+            if name == "tool_call":
+                # Служебный тег-инструмент (описывает формат вызова) — в списке
+                # тулов не выводим, чтобы не путать модель.
+                continue
             desc = func.get("description", "")
             params = func.get("parameters", {})
-            if name in FULL_SCHEMA_TOOLS:
-                # Полный режим: имя + описание + полная схема параметров.
-                schema = _format_full_schema(params)
-                immediate_descs.append(f"  - {name}: {desc}\n    params: {schema}")
-            else:
-                # Отложенный режим: схема параметров не показана.
-                d = _first_paragraph(desc) if SHORTEN_DEFERRED_DESC else desc
-                deferred_descs.append(f"  - {name} [deferred]: {d}")
-#        tool_header = "Не используй описанные ранее инструменты, если такие есть. Не используй правила их вызова для описанных далее инструментов" + chr(10)
-#        tool_header += "Для вызова инструментов выводи вызов инструмента простым текстом так, как это описано далее." + chr(10)
-        tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
-        tool_header += tc_open + chr(10)
-        tool_header += "  " + lt + "tool_call" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
-        tool_header += "    " + lt + "parameter" + " name=" + dq + "PARAM_NAME" + dq + gt + "VALUE" + lt + "/parameter" + gt + chr(10)
-        tool_header += "  " + lt + "/tool_call" + gt + chr(10)
-        tool_header += tc_close + chr(10)
+            schema = _format_full_schema(params)
+            immediate_descs.append(f"  - {name}: {_fix_tool_desc(desc)}\n    params: {_fix_tool_desc(schema)}")
+
+        tool_header = tool_coll_header + "You have access to the following tools:" + chr(10)
+
         if immediate_descs:
             tool_header += "# Available tools:" + chr(10)
             tool_header += chr(10).join(immediate_descs) + chr(10)
-        if deferred_descs:
-            tool_header += chr(10)
-            tool_header += "# Deferred tool catalog (call schemas via `tool_describe`, invoke via `tool_call`):" + chr(10)
-            tool_header += chr(10).join(deferred_descs) + chr(10)
-        tool_header += "Only call tools when the user explicitly asks. Otherwise respond normally." + chr(10)
         tool_header += chr(10)
         parts.insert(0, tool_header)
     lt = chr(60)
@@ -880,6 +905,7 @@ def parse_tool_calls(text, available_tools=None):
     import re, json
     if MASK_CODE_FENCES:
         text = _mask_code_fences(text)
+    text = _normalize_spaced_tags(text)
     tool_calls = []
     available_names = set()
     if available_tools:
@@ -902,10 +928,14 @@ def parse_tool_calls(text, available_tools=None):
 
     def _parse_props(txt):
         result = {}
+        param_pat_usr = '<usr_parameter\\s+name="([^"]+)"[^>]*>(.*?)</usr_parameter>'
         param_pat = '<parameter\\s+name="([^"]+)"[^>]*>(.*?)</parameter>'
         param_pat2 = '<param\\s+name="([^"]+)"[^>]*>(.*?)</param>'
-        for m in re.finditer(param_pat, txt, re.DOTALL):
-            result[m.group(1)] = _clean(m.group(2))
+        for pat in (param_pat_usr, param_pat):
+            for m in re.finditer(pat, txt, re.DOTALL):
+                result[m.group(1)] = _clean(m.group(2))
+            if result:
+                break
         if not result:
             for m in re.finditer(param_pat2, txt, re.DOTALL):
                 result[m.group(1)] = _clean(m.group(2))
@@ -921,6 +951,14 @@ def parse_tool_calls(text, available_tools=None):
             for m in re.finditer(attr_pat, txt):
                 result[m.group(1)] = m.group(2)
         return result
+
+    # Format 0: usr_-prefixed taught format (current):
+    # <usr_tool_calls> / <usr_tool_call name="..."> / <usr_parameter name="...">value</usr_parameter>
+    for m in re.finditer('<usr_tool_call\\s+name="([^"]+)"[^>]*>(.*?)</usr_tool_call>', text, re.DOTALL):
+        name, props = m.group(1), m.group(2)
+        if _valid(name):
+            args = _parse_props(props) or {}
+            tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
     # Format 1: invoke with parameter tags
     for m in re.finditer('<invoke name="([^"]+)">(.*?)</invoke>', text, re.DOTALL):
@@ -1236,7 +1274,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
             _masked_prev = _mask_code_fences(prev_text) if MASK_CODE_FENCES else prev_text
-            if re.search(r'<tool_call\s+name=', _masked_prev) or re.search(r'<invoke\s+name=', _masked_prev) or re.search(r'<tool_call>\s*<name>', _masked_prev):
+            if re.search(r'<usr_tool_call\s+name=', _masked_prev) or re.search(r'<tool_call\s+name=', _masked_prev) or re.search(r'<invoke\s+name=', _masked_prev) or re.search(r'<tool_call>\s*<name>', _masked_prev):
                 is_tool_result = True
                 rlog(req_id, f"DETECT: prev assistant (via scan) has tool_call XML → tool_result")
             elif prev.get("tool_calls"):
@@ -1352,6 +1390,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             display_len = len(content)
             rlog(req_id, f"ACTION: wrap tool_result (fallback) → DeepSeek id={tc_id}")
             rlog(req_id, f"Tool result content ({orig_len} chars → {display_len} chars{' — TRUNCATED' if display_len < orig_len else ''}): {content[:500]}")
+        prompt += "\n\n" + tool_coll_header
     elif is_rollback:
         prompt = last_content
         rlog(req_id, f"ACTION: regenerate (rollback) → raw message (no User: prefix)")
@@ -1421,7 +1460,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     # невидима и не останавливает стрим.
                     context = text_buf + text
                     ctx = _mask_code_fences(context) if MASK_CODE_FENCES else context
-                    m = re.search(r'<(?:invoke|tool_calls?)[\s>]', ctx)
+                    m = re.search(r'<\s*(?:invoke|tool_calls?)[\s>]', ctx)
                     if m:
                         tool_start = m.start()
                         before = _strip_tool_tags(context[:tool_start])
@@ -1461,7 +1500,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     # If mid-stream didn't fire, send text before first tool call now
                     if not in_tool_call:
                         masked_full = _mask_code_fences(full_text) if MASK_CODE_FENCES else full_text
-                        m = re.search(r'<(?:invoke|tool_call|tool_calls)[\s>]', masked_full)
+                        m = re.search(r'<\s*(?:invoke|tool_call|tool_calls)[\s>]', masked_full)
                         if m:
                             before = _strip_tool_tags(full_text[:m.start()])
                             if before:
@@ -1523,7 +1562,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 rlog(req_id, f"DEEPSEEK ERROR: {e} finish_reason={e.finish_reason}")
                 on_error(e)
             except Exception as e:
-                rlog(req_id, f"STREAM ERROR: {e}")
+                rlog(req_id, f"STREAM ERROR: [{type(e).__name__}] {e}")
                 if not session_cleaned:
                     session_cleaned = True
                     for k, v in list(_session_store.items()):

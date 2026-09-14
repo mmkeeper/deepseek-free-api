@@ -164,6 +164,29 @@ def test_dsml_marker_filtered_from_thinking():
     assert marker not in joined, f"DSML marker leaked in thinking: {joined!r}"
 
 
+def test_dsml_marker_padded_with_spaces_filtered():
+    """Padded ||DSML|| delimiter is fully stripped — including the padding spaces."""
+    import asyncio
+    from src.sse import stream_sse
+
+    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+
+    class FakeResp:
+        async def aiter_text(self):
+            for chunk in [
+                f'data: {{"v": "<invoke"}}\n\n',
+                f'data: {{"v": "  {marker}  "}}\n\n',
+                f'data: {{"v": " name=foo>"}}\n\n',
+            ]:
+                yield chunk
+
+    out_text, out_think = [], []
+    asyncio.run(stream_sse(FakeResp(), on_text=out_text.append, on_thinking=out_think.append))
+    joined = "".join(out_text)
+    assert marker not in joined, f"DSML marker leaked: {joined!r}"
+    assert joined == "<invoke name=foo>", f"marker padding spaces left behind: {joined!r}"
+
+
 if __name__ == "__main__":
     tests = [
         test_think_snapshot_delta,
@@ -176,6 +199,7 @@ if __name__ == "__main__":
         test_delta_tracking_response,
         test_dsml_marker_filtered_from_text,
         test_dsml_marker_filtered_from_thinking,
+        test_dsml_marker_padded_with_spaces_filtered,
     ]
     for t in tests:
         try:

@@ -19,7 +19,7 @@ def detect_tool_result(messages):
             prev_text = prev.get("content") or ""
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
-            if re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text) or re.search(r'<tool_call>\s*<name>', prev_text):
+            if re.search(r'<usr_tool_call\s+name=', prev_text) or re.search(r'<tool_call\s+name=', prev_text) or re.search(r'<invoke\s+name=', prev_text) or re.search(r'<tool_call>\s*<name>', prev_text):
                 is_tool_result = True
             elif prev.get("tool_calls"):
                 is_tool_result = True
@@ -119,6 +119,18 @@ def test_openai_tool_calls_empty_content():
     print(f"  PASS: empty content + tool_calls -> tool_call_id={tid}")
 
 
+def test_usr_xml_in_content():
+    msgs = [
+        {"role": "system", "content": "test"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": '<usr_tool_calls>\n  <usr_tool_call name="web_search">\n    <usr_parameter name="query">test</usr_parameter>\n  </usr_tool_call>\n</usr_tool_calls>'},
+        {"role": "user", "content": "tool result here"},
+    ]
+    r, _ = detect_tool_result(msgs)
+    assert r is True, f"expected True, got {r}"
+    print("  PASS: usr_ XML in content -> detected=True")
+
+
 if __name__ == "__main__":
     tests = [
         test_xml_in_content,
@@ -128,6 +140,7 @@ if __name__ == "__main__":
         test_regular_user_message,
         test_assistant_with_content_no_tool,
         test_openai_tool_calls_empty_content,
+        test_usr_xml_in_content,
     ]
     for t in tests:
         try:
