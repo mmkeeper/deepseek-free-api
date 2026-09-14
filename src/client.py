@@ -19,11 +19,17 @@ log = logging.getLogger("ds")
 
 # Backoff (seconds) between retries. DeepSeek answers with a retryable error
 # (rate_limit_reached — "Слишком частые сообщения", expert_busy_use_default —
-# "Сервер перегружен. Попробуйте позже или используйте быстрый режим") when
-# requests come in too often or the server is busy. Retry with 1, 2, 4, 8, 16,
-# 32, 64 s — 7 attempts total before the error is propagated to the client.
-# Delay values are logged so the real needed spacing can be tuned later.
-_RETRYABLE_FINISH_REASONS = {"rate_limit_reached", "expert_busy_use_default"}
+# "Сервер перегружен. Попробуйте позже или используйте быстрый режим", and
+# generation_timeout — "Сервер занят, пожалуйста, попробуйте позже." /
+# "Server busy, please try again later.") when requests come in too often or
+# the server is busy. Retry with 1, 2, 4, 8, 16, 32, 64 s — 7 attempts total
+# before the error is propagated to the client. Delay values are logged so the
+# real needed spacing can be tuned later.
+_RETRYABLE_FINISH_REASONS = {
+    "rate_limit_reached",
+    "expert_busy_use_default",
+    "generation_timeout",
+}
 _RATE_LIMIT_BACKOFF = [1, 2, 4, 8, 16, 32, 64]
 
 # Polling backoff (seconds) between fetch_files attempts while a file is being
@@ -361,11 +367,13 @@ class DeepSeekClient:
         """Call _complete_once, retrying on retryable errors.
 
         DeepSeek returns an SSE hint with finish_reason=rate_limit_reached
-        ("Слишком частые сообщения") when we hit the per-user rate limit, or
+        ("Слишком частые сообщения") when we hit the per-user rate limit,
         finish_reason=expert_busy_use_default ("Сервер перегружен...") when
-        the server is busy. Retry with backoff 1, 2, 4, 8, 16, 32, 64 s. If
-        the request still fails after all retries the last error is propagated
-        to the caller.
+        the server is busy, and finish_reason=generation_timeout
+        ("Сервер занят, пожалуйста, попробуйте позже.") when generation was
+        discarded because the server was too busy to start it. Retry with
+        backoff 1, 2, 4, 8, 16, 32, 64 s. If the request still fails after all
+        retries the last error is propagated to the caller.
         Retries happen only when the failure arrived before any content was
         emitted — replaying an already-partially-streamed response would
         duplicate output for the client.

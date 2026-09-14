@@ -146,10 +146,31 @@ def test_retries_on_expert_busy_use_default():
     assert len(attempts) == 2
 
 
+def test_retries_on_generation_timeout():
+    """generation_timeout ("Сервер занят...") is retryable too."""
+    sleeps = []
+    attempts = []
+
+    async def fake_once(**kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise DeepSeekError("Сервер занят, пожалуйста, попробуйте позже.", "generation_timeout")
+        return {"lastAssistantMessageId": 10, "text": "ok", "thinking": ""}
+
+    c = _client(_complete_once=fake_once)
+    with mock.patch("asyncio.sleep", side_effect=lambda s: sleeps.append(s)):
+        result = _run(c.complete("sid", "prompt", req_id="t7"))
+
+    assert result == {"lastAssistantMessageId": 10, "text": "ok", "thinking": ""}
+    assert sleeps == [1], f"expected backoff 1s got {sleeps}"
+    assert len(attempts) == 2
+
+
 def test_retryable_finish_reasons_set():
-    """The retryable finish reasons include both known transient errors."""
+    """The retryable finish reasons include all known transient errors."""
     assert "rate_limit_reached" in _RETRYABLE_FINISH_REASONS
     assert "expert_busy_use_default" in _RETRYABLE_FINISH_REASONS
+    assert "generation_timeout" in _RETRYABLE_FINISH_REASONS
 
 
 if __name__ == "__main__":
@@ -160,6 +181,7 @@ if __name__ == "__main__":
         test_no_retry_after_partial_output,
         test_retries_after_message_id_only,
         test_retries_on_expert_busy_use_default,
+        test_retries_on_generation_timeout,
         test_retryable_finish_reasons_set,
     ]
     for t in tests:
