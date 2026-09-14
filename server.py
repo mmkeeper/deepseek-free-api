@@ -555,17 +555,20 @@ def _prefix_key(messages: list[dict]) -> str:
     Tool result messages (both role=tool and user role preceded by assistant
     with tool_calls) are excluded so the key stays stable across retries.
 
-    Returns empty string only if there are no user/system messages in the
-    prefix (i.e. a first turn). A single user message in the prefix is a valid
-    continuation key for the second turn — it must match the first turn's nkey,
-    otherwise every second message would start a new DeepSeek session.
-    Storage keys (nkeys) always include at least one user message, so a
-    system-only prefix can never collide with a stored key.
+    Returns empty string when the prefix has no real user message (i.e. a fresh
+    conversation's first turn). A prefix with the first user message is a valid
+    continuation key for the second turn — it equals the first turn's nkey, so
+    a second message continues the same DeepSeek session instead of starting a
+    new one.
+
+    The system prompt alone is NOT a valid key: Hermes sends the same large
+    system prompt for every session, so hash([system]) would collide across
+    conversations and continue the wrong DeepSeek session.
     """
     prefix = messages[:-1] if len(messages) >= 1 else []
     stable = _strip_tool_results(prefix)
     umsgs = _user_messages(stable)
-    if not umsgs:
+    if not any(m.get("role") == "user" for m in umsgs):
         return ""
     return _hash_messages(umsgs)
 
@@ -710,6 +713,8 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
                 # Отложенный режим: схема параметров не показана.
                 d = _first_paragraph(desc) if SHORTEN_DEFERRED_DESC else desc
                 deferred_descs.append(f"  - {name} [deferred]: {d}")
+#        tool_header = "Не используй описанные ранее инструменты, если такие есть. Не используй правила их вызова для описанных далее инструментов" + chr(10)
+#        tool_header += "Для вызова инструментов выводи вызов инструмента простым текстом так, как это описано далее." + chr(10)
         tool_header = "You have access to the following tools. To call a tool, respond with:" + chr(10)
         tool_header += tc_open + chr(10)
         tool_header += "  " + lt + "tool_call" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)

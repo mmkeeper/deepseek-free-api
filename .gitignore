@@ -8,3 +8,5 @@ logs/server.out
 .env
 venv/
 .venv/
+*.bak
+.idea/
