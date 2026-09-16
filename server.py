@@ -740,10 +740,10 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
         for t in tools:
             func = t.get("function", {})
             name = func.get("name", "unknown")
-            if name == "tool_call":
-                # Служебный тег-инструмент (описывает формат вызова) — в списке
-                # тулов не выводим, чтобы не путать модель.
-                continue
+#            if name == "tool_call":
+#                # Служебный тег-инструмент (описывает формат вызова) — в списке
+#                # тулов не выводим, чтобы не путать модель.
+#                continue
             desc = func.get("description", "")
             params = func.get("parameters", {})
             schema = _format_full_schema(params)
