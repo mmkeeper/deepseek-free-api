@@ -325,8 +325,9 @@ def test_midline_backtick_run_in_param_value():
     print("  PASS: mid-line backtick run in param value is not a fence")
 
 
-def test_example_in_code_fence_ignored():
-    """Пример формата внутри ```-блока — не реальный вызов (при включённой маске)."""
+def test_plain_code_fence_with_call_xml_executes():
+    """Код-блок верхнего уровня (любая инфо-строка, здесь пустая) с XML вызова —
+    РЕАЛЬНЫЙ вызов, а не пример. Контентное правило."""
     server.MASK_CODE_FENCES = True
     try:
         text = """Вот как вызывать инструменты:
@@ -341,10 +342,12 @@ def test_example_in_code_fence_ignored():
 
 Нужно ещё что-то?"""
         tcs = parse_tool_calls(text)
-        assert tcs == [], f"expected no tool calls, got {tcs}"
+        assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
+        assert tcs[0]["name"] == "ИМЯ_ИНСТРУМЕНТА", tcs
+        assert json.loads(tcs[0]["arguments"]) == {"ПАРАМЕТР": "ЗНАЧЕНИЕ"}, tcs
     finally:
         server.MASK_CODE_FENCES = False
-    print("  PASS: example inside code fence ignored (mask on)")
+    print("  PASS: top-level plain code fence with call XML executes")
 
 
 def test_masking_disabled_parses_fenced_call():
@@ -364,7 +367,7 @@ def test_masking_disabled_parses_fenced_call():
 
 
 def test_real_call_after_closed_fence():
-    """Реальный вызов после закрытого код-блока с примером парсится."""
+    """Вызовы в ```-блоке верхнего уровня И сырой inline-вызов парсятся оба."""
     server.MASK_CODE_FENCES = True
     try:
         text = """Пример:
@@ -381,12 +384,12 @@ def test_real_call_after_closed_fence():
   <parameter name="path">C:\\Projects</parameter>
 </tool_call>"""
         tcs = parse_tool_calls(text)
-        assert len(tcs) == 1, f"expected 1 tool call, got {len(tcs)}: {tcs}"
-        assert tcs[0]["name"] == "search_files"
-        assert json.loads(tcs[0]["arguments"]) == {"path": "C:\\Projects"}
+        assert len(tcs) == 2, f"expected 2 tool calls, got {len(tcs)}: {tcs}"
+        assert [t["name"] for t in tcs] == ["FAKE", "search_files"], tcs
+        assert json.loads(tcs[1]["arguments"]) == {"path": "C:\\Projects"}
     finally:
         server.MASK_CODE_FENCES = False
-    print("  PASS: real call after closed fence parsed (mask on)")
+    print("  PASS: fenced + inline calls both parsed (content rule)")
 
 
 def test_unclosed_fence_masks_tail():
@@ -528,8 +531,8 @@ def test_usr_strip_tool_tags():
     print("  PASS: _strip_tool_tags handles usr_ tags")
 
 
-def test_usr_format_in_fence_defused():
-    """Пример usr_ формата внутри ```-блока — не реальный вызов (mask on)."""
+def test_usr_format_in_plain_fence_executes():
+    """Пример usr_ формата в ```-блоке верхнего уровня — реальный вызов."""
     server.MASK_CODE_FENCES = True
     try:
         text = """Вот формат:
@@ -543,10 +546,45 @@ def test_usr_format_in_fence_defused():
 ```
 """
         tcs = parse_tool_calls(text)
-        assert tcs == [], f"expected no tool calls, got {tcs}"
+        assert len(tcs) == 1, f"expected 1 call, got {len(tcs)}: {tcs}"
+        assert tcs[0]["name"] == "web_search", tcs
     finally:
         server.MASK_CODE_FENCES = False
-    print("  PASS: usr_ example inside fence ignored (mask on)")
+    print("  PASS: usr_ example in plain top-level fence now executes")
+
+
+
+def test_plain_xml_block_executed_log_case():
+    """Регресс REQ-3538dd0009: вызов, обёрнутый моделью в ```xml...```,
+    исполняется (2 вызова), а не уходит клиенту текстом."""
+    server.MASK_CODE_FENCES = True
+    try:
+        text = """Хороший вопрос.
+
+```xml
+<usr_tool_calls>
+  <usr_tool_call name="search_files">
+    <usr_parameter name="pattern">Deferred tool catalog</usr_parameter>
+    <usr_parameter name="path">C:/Users/keeper/AppData/Local/hermes</usr_parameter>
+    <usr_parameter name="output_mode">files_only</usr_parameter>
+    <usr_parameter name="limit">20</usr_parameter>
+  </usr_tool_call>
+  <usr_tool_call name="search_files">
+    <usr_parameter name="pattern">*deferred*</usr_parameter>
+    <usr_parameter name="path">C:/Users/keeper/AppData/Local/hermes</usr_parameter>
+    <usr_parameter name="limit">30</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>
+```"""
+        tcs = parse_tool_calls(text)
+        assert len(tcs) == 2, f"expected 2 calls, got {len(tcs)}: {tcs}"
+        assert [t["name"] for t in tcs] == ["search_files", "search_files"], tcs
+        # дефолтная маска по-прежнему обезвреживает разметку в таком блоке
+        out = _mask_code_fences(text)
+        assert "usr_t00l" in out, out
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: ```xml-wrapped call executes (REQ-3538dd0009)")
 
 
 def test_usr_inline_mention_defused():
@@ -630,6 +668,23 @@ def test_spaced_tags_stripped_from_client_text():
     print("  PASS: spaced tags stripped from client text")
 
 
+def test_strip_tool_tags_keeps_literal_mention():
+    """Литеральное упоминание `<usr_tool_calls>` в прозе — НЕ вызов и НЕ вырезается.
+    (Сообщено: «что вызывать надо через <usr_tool_calls>» превращалось в «через .»)."""
+    out = _strip_tool_tags("что вызывать надо через <usr_tool_calls>")
+    assert "<usr_tool_calls>" in out, f"literal mention must survive: {out!r}"
+    out2 = _strip_tool_tags("а потом <usr_tool_call name='x'> и <parameter name='q'>")
+    assert "<usr_tool_call" in out2 and "<parameter" in out2, out2
+    # полная структура вызова по-прежнему вырезается
+    out3 = _strip_tool_tags("до <usr_tool_calls><usr_tool_call name=\"x\"><usr_parameter name=\"p\">1</usr_parameter></usr_tool_call></usr_tool_calls> после")
+    assert "<usr_tool" not in out3, out3
+    assert "до" in out3 and "после" in out3, out3
+    # полная структура в ```-фенсе сохраняется (примеры формата)
+    out4 = _strip_tool_tags("```\n<usr_tool_calls>\n  <usr_tool_call name=\"y\"/>\n</usr_tool_calls>\n```")
+    assert "<usr_tool_call name=\"y\"/>" in out4, out4
+    print("  PASS: literal <usr_tool_calls> mention preserved; complete structures stripped")
+
+
 def test_dsml_marker_glued_into_tags_scrubbed():
     """Остатки маркера ||DSML||, приклеенные к тегам, чистятся до распознавания."""
     from server import _DSML_GLUE_RE
@@ -672,6 +727,167 @@ def test_usr_param_typo_closing_tag_does_not_swallow_xml():
     print("  PASS: typo in closing tag keeps parameter values clean")
 
 
+def test_vyzov_block_calls_parsed():
+    """Вызовы внутри блока ```Вызов ... ``` распознаются (tool_coll_header Шаг 3)."""
+    server.MASK_CODE_FENCES = True
+    try:
+        src = """Посмотрю файлы.
+
+```Вызов
+<usr_tool_calls>
+  <usr_tool_call name="search_files">
+    <usr_parameter name="path">C:\\docs</usr_parameter>
+    <usr_parameter name="pattern">*.md</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>
+```
+
+Готово."""
+        tcs = parse_tool_calls(src)
+        assert len(tcs) == 1, f"expected 1 call, got {len(tcs)}: {tcs}"
+        assert tcs[0]["name"] == "search_files", tcs
+        assert json.loads(tcs[0]["arguments"]) == {"path": "C:\\docs", "pattern": "*.md"}, tcs
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: calls inside ```Вызов block parsed")
+
+
+def test_vyzov_block_stripped_from_narrative():
+    """Блок Вызов вырезается из клиентского текста целиком (фенсы + тело)."""
+    from server import _strip_vyzov_blocks
+    src = """Смотрю.
+
+```Вызов
+<usr_tool_calls>
+  <usr_tool_call name="search_files"><usr_parameter name="p">v</usr_parameter></usr_tool_call>
+</usr_tool_calls>
+```
+
+Дальше."""
+    out = _strip_vyzov_blocks(src)
+    assert "<usr_tool" not in out, out
+    assert "Вызов" not in out, out
+    assert "```" not in out, out
+    assert "Смотрю." in out and "Дальше." in out, out
+    print("  PASS: Вызов block fully stripped from narrative")
+
+
+def test_vyzov_block_info_case_insensitive():
+    """Контентное правило: блок === вызов по XML в теле, а не по инфо-строке."""
+    from server import _vyzov_block_spans
+    for tag in ("Вызов", "вызов", "ВЫЗОВ", "xml", "", "markdown"):
+        src = "```%s\n<usr_tool_call name=\"x\"><usr_parameter name=\"a\">1</usr_parameter></usr_tool_call>\n```" % tag
+        spans = _vyzov_block_spans(src)
+        assert len(spans) == 1, (tag, spans)
+    # без tool-тега — НЕ вызов
+    assert _vyzov_block_spans("```xml\n<json>данные</json>\n```") == []
+    # тильда-фенс с XML — НЕ вызов (только бэктики)
+    assert _vyzov_block_spans("~~~\n<usr_tool_call name=\"x\"/>\n~~~") == []
+    print("  PASS: content-based call blocks (info string irrelevant); tilde excluded")
+
+
+def test_vyzov_block_untouched_by_mask():
+    """keep_vyzov=True оставляет содержимое блока Вызов нетронутым; длина сохраняется."""
+    from server import _mask_code_fences
+    src = "```Вызов\n<tool_call name=\"x\">call</tool_call>\n```"
+    out = _mask_code_fences(src, keep_vyzov=True)
+    assert "<tool_call" in out and "<t00l_call" not in out, out
+    assert len(out) == len(src), "mask must preserve length"
+    # без keep_vyzov — по-прежнему маскируется
+    out2 = _mask_code_fences(src)
+    assert "<t00l_call" in out2, out2
+    print("  PASS: keep_vyzov preserves Вызов block content")
+
+
+def test_demo_double_escaped_vyzov_not_executed():
+    """Демонстрация вызова с двойным экранированием (```` вокруг ```Вызов) —
+    это НЕ вызов: вложенный блок верхнего уровня не существуют для парсера.
+    """
+    server.MASK_CODE_FENCES = True
+    try:
+        src = """Как это делается:
+
+````markdown
+```Вызов
+<usr_tool_calls>
+  <usr_tool_call name="search_files">
+    <usr_parameter name="path">C:\\docs</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>
+```
+````
+
+Продолжение."""
+        out = _mask_code_fences(src, keep_vyzov=True)
+        assert len(out) == len(src), "mask must preserve length"
+        assert "<usr_t00l" in out or "<t00l_" in out, f"demo must be defused: {out}"
+        assert parse_tool_calls(src) == [], f"demo must not execute: {parse_tool_calls(src)}"
+        # реальный (верхнего уровня) вызов ниже всё равно распознаётся
+        real = src + "\n```Вызов\n<usr_tool_calls>\n  <usr_tool_call name=\"search_files\">\n    <usr_parameter name=\"path\">C:\\x</usr_parameter>\n  </usr_tool_call>\n</usr_tool_calls>\n```"
+        r2 = parse_tool_calls(real)
+        assert len(r2) == 1 and r2[0]["name"] == "search_files", r2
+    finally:
+        server.MASK_CODE_FENCES = False
+    print("  PASS: double-escaped demo not executed; top-level call still parsed")
+
+
+def test_strip_vyzov_blocks_keeps_nested_demo():
+    """_strip_vyzov_blocks не вырезает демо-блок (вложенный Вызов), но вырезает
+    реальный блок верхнего уровня."""
+    from server import _strip_vyzov_blocks
+    out = _strip_vyzov_blocks("````\n```Вызов\nx\n```\n````")
+    assert "Вызов" in out and "````" in out, out
+    out2 = _strip_vyzov_blocks("```Вызов\n<usr_tool_calls>x</usr_tool_calls>\n```")
+    assert "Вызов" not in out2, out2
+    print("  PASS: strip_vyzov_blocks is nesting-aware")
+
+
+def test_find_vyzov_open_top_level_only():
+    """_find_vyzov_open находит начало первого блок-вызова верхнего уровня."""
+    from server import _find_vyzov_open
+    # двойное экранирование (демо) — не вызов
+    assert _find_vyzov_open("````\n```Вызов\n<usr_tool_calls>\n  <usr_tool_call name=\"x\"><usr_parameter name=\"a\">1</usr_parameter></usr_tool_call>\n</usr_tool_calls>\n```\n````") is None, "nested demo skipped"
+    # блок Вызов, вложенный в другой блок верхнего уровня — не вызов
+    assert _find_vyzov_open("```xml\n```Вызов\n<usr_tool_call name=\"x\"/>\n```\n```") is None, "nested in xml block skipped"
+    # верхний уровень: блок Вызов с XML — позиция его фенса
+    src = "пред.\n\n```Вызов\n<usr_tool_calls>\n  <usr_tool_call name=\"x\"><usr_parameter name=\"a\">1</usr_parameter></usr_tool_call>\n</usr_tool_calls>\n```"
+    pos = _find_vyzov_open(src)
+    assert pos == src.find("```Вызов"), (pos, src.find("```Вызов"))
+    # верхний уровень: простой ```xml блок с XML — тоже позиция фенса
+    src2 = "```xml\n<usr_tool_calls>\n  <usr_tool_call name=\"y\"><usr_parameter name=\"b\">2</usr_parameter></usr_tool_call>\n</usr_tool_calls>\n```"
+    pos2 = _find_vyzov_open(src2)
+    assert pos2 == src2.find("```xml"), pos2
+    # верхний уровень: пустой ``` с XML — позиция фенса
+    src3 = "до\n```\n<usr_tool_calls><usr_tool_call name=\"z\"><usr_parameter name=\"c\">3</usr_parameter></usr_tool_call></usr_tool_calls>\n```"
+    pos3 = _find_vyzov_open(src3)
+    assert pos3 == src3.find("```\n<usr_tool_calls"), pos3
+    # без вызовов — None
+    assert _find_vyzov_open("вот блок ```xml\n<json>данные</json>\n```") is None
+    print("  PASS: _find_vyzov_open is top-level content-based")
+
+
+def test_messages_to_prompt_blank_line_between_tools():
+    """Пустая строка между описаниями тулов в списке."""
+    from server import messages_to_prompt
+    tools = [
+        {"type": "function", "function": {
+            "name": "t1", "description": "one",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+        {"type": "function", "function": {
+            "name": "t2", "description": "two",
+            "parameters": {"type": "object", "properties": {}, "required": []}}},
+    ]
+    out = messages_to_prompt(
+        [{"role": "system", "content": ""}, {"role": "user", "content": "hi"}],
+        tools,
+    )
+    i1 = out.find("  - t1: one")
+    i2 = out.find("  - t2: two")
+    assert i1 != -1 and i2 != -1, out
+    assert "\n\n" in out[i1 + len("  - t1: one"):i2], out[i1:i2]
+    print("  PASS: blank line between tool descriptions")
+
+
 if __name__ == "__main__":
     tests = [
         test_nested_quadruple_fence_defused,
@@ -691,7 +907,7 @@ if __name__ == "__main__":
         test_wrapper_multiple_direct_tags,
         test_zero_argument_calls,
         test_single_inline_mention_breaks_nothing,
-        test_example_in_code_fence_ignored,
+        test_plain_code_fence_with_call_xml_executes,
         test_masking_disabled_parses_fenced_call,
         test_real_call_after_closed_fence,
         test_unclosed_fence_masks_tail,
@@ -705,14 +921,24 @@ if __name__ == "__main__":
         test_usr_format_zero_args,
         test_usr_format_in_token_tool_header_rendered,
         test_usr_strip_tool_tags,
-        test_usr_format_in_fence_defused,
+        test_usr_format_in_plain_fence_executes,
+        test_plain_xml_block_executed_log_case,
         test_usr_inline_mention_defused,
         test_fix_tool_desc_rewrites_format_mentions,
         test_messages_to_prompt_rewrites_tool_descriptions,
         test_spaced_tags_parsed,
         test_spaced_tags_stripped_from_client_text,
+        test_strip_tool_tags_keeps_literal_mention,
         test_dsml_marker_glued_into_tags_scrubbed,
         test_usr_param_typo_closing_tag_does_not_swallow_xml,
+        test_vyzov_block_calls_parsed,
+        test_vyzov_block_stripped_from_narrative,
+        test_vyzov_block_info_case_insensitive,
+        test_vyzov_block_untouched_by_mask,
+        test_demo_double_escaped_vyzov_not_executed,
+        test_strip_vyzov_blocks_keeps_nested_demo,
+        test_find_vyzov_open_top_level_only,
+        test_messages_to_prompt_blank_line_between_tools,
     ]
     for t in tests:
         try:

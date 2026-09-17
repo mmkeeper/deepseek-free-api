@@ -39,35 +39,36 @@ tc_close = lt + "/usr_tool_calls" + gt
 tool_coll_header = "To call a tool, respond with:" + chr(10)
 tool_coll_header += tc_open + chr(10)
 tool_coll_header += "  " + lt + "usr_tool_call" + " name=" + dq + "TOOL_NAME" + dq + gt + chr(10)
-tool_coll_header += "    " + lt + "usr_parameter" + " name=" + dq + "PARAM_NAME" + dq + gt + "VALUE" + lt + "/usr_parameter" + gt + chr(
-    10)
+tool_coll_header += "    " + lt + "usr_parameter" + " name=" + dq + "PARAM_NAME" + dq + gt + "VALUE" + lt + "/usr_parameter" + gt + chr(10)
 tool_coll_header += "  " + lt + "/usr_tool_call" + gt + chr(10)
 tool_coll_header += tc_close + chr(10) + chr(10)
-tool_coll_header += "ПЕРЕД ВЫЗОВОМ ЛЮБОГО ИНСТРУМЕНТА — трёхшаговый протокол. Шаги нельзя пропускать, сливать или менять местами." + chr(
-    10)
+tool_coll_header += "Имена и описания параметров каждого инструмента содержатся в формате JSON в описании каждого инструмента." + chr(10)
+tool_coll_header += "Значения параметров при вызове инструмента выводятся в формате JSON в тегах <usr_parameter name=\"ИМЯ_ПАРАМЕТРА\">ЗНАЧЕНИЕ</usr_parameter>" + chr(10) + chr(10)
+tool_coll_header += "ПЕРЕД ВЫЗОВОМ ЛЮБОГО ИНСТРУМЕНТА — трёхшаговый протокол. Шаги нельзя пропускать, сливать или менять местами." + chr(10)
 tool_coll_header += chr(10)
-tool_coll_header += "Шаг 1. Черновик." + chr(10)
+tool_coll_header += "Шаг 1. Черновик (только при включённых размышлениях)." + chr(10)
 tool_coll_header += "В блоке размышлений выведи предполагаемый XML вызова целиком — в блоке:" + chr(10)
 tool_coll_header += "```xml" + chr(10)
 tool_coll_header += "XML" + chr(10)
 tool_coll_header += "```" + chr(10)
-tool_coll_header += "Сырой, неэкранированный XML вызова в размышлениях писать запрещено." + chr(10)
+tool_coll_header += "Это черновик: XML в размышлениях инструмент НЕ вызывает." + chr(10)
 tool_coll_header += chr(10)
 tool_coll_header += "Шаг 2. Проверка." + chr(10)
 tool_coll_header += "Сравни черновик с эталонным форматом (приведён выше) по каждому пункту:" + chr(10)
 tool_coll_header += "  — открывающий тег ровно <usr_tool_calls>;" + chr(10)
 tool_coll_header += "  — тег вызова ровно <usr_tool_call name=\"ИМЯ_ИНСТРУМЕНТА\">;" + chr(10)
-tool_coll_header += "  — каждый параметр ровно <usr_parameter name=\"ИМЯ_ПАРАМЕТРА\">ЗНАЧЕНИЕ</usr_parameter>;" + chr(
-    10)
+tool_coll_header += "  — каждый параметр ровно <usr_parameter name=\"ИМЯ_ПАРАМЕТРА\">ЗНАЧЕНИЕ</usr_parameter>;" + chr(10)
 tool_coll_header += "  — закрывающие теги ровно </usr_tool_call> и </usr_tool_calls>;" + chr(10)
-tool_coll_header += "  — все имена тегов имеют префикс \"usr_\"; синонимы и теги из иных синтаксисов (parameter, invoke, calls, function, tool_call и любые другие) НЕДОПУСТИМЫ;" + chr(
-    10)
+tool_coll_header += "  — все имена тегов имеют префикс \"usr_\"; синонимы и теги из иных синтаксисов (parameter, invoke, calls, function, tool_call и любые другие) НЕДОПУСТИМЫ;" + chr(10)
 tool_coll_header += "  — угловые скобки парны, вложенность корректна, лишних атрибутов нет." + chr(10)
-tool_coll_header += "Если хотя бы один пункт не выполняется — исправь черновик и проверь заново, прежде чем идти дальше." + chr(
-    10)
+tool_coll_header += "Если хотя бы один пункт не выполняется — исправь черновик и проверь заново, прежде чем идти дальше." + chr(10)
 tool_coll_header += chr(10)
-tool_coll_header += "Шаг 3. Вызов. Твой видимый ответ должен быть расположен вне блока размышлений и состоять из проверенного XML" + chr(10)
-tool_coll_header += "Выводи его в СЫРОМ виде, скопировав проверенный XML ПОСИМВОЛЬНО, без единого изменения. Не «оформляй» вызов: не оборачивай в ```-блок, не выделяй кавычками, не добавляй отступов-цитаты. Любая обёртка — это уже другой ответ, и инструмент не исполнится." + chr(10)
+tool_coll_header += "Шаг 3. Вызов — только вне блока размышлений и только внутри блока вызова:" + chr(10)
+tool_coll_header += "```Вызов" + chr(10)
+tool_coll_header += "XML" + chr(10)
+tool_coll_header += "```" + chr(10)
+tool_coll_header += "Скопируй проверенный XML ПОСИМВОЛЬНО, без единого изменения, и вставь его в блок ```Вызов ... ```. Блок \"Вызов\" — единственный способ исполнить инструмент: голый XML в обычном тексте и в любом другом код-блоке (xml, markdown и т.п.) не исполняется. Внутри блока помещай только XML, без пояснений." + chr(10)
+tool_coll_header += "Если размышления выключены — черновик и проверку выполни мысленно, вызов всё равно выводится в блоке \"Вызов\"." + chr(10)
 tool_coll_header += "Если в момент генерации возникает вариант с другим именем тега — остановись, вернись к Шагу 1 и повтори цикл." + chr(10)
 
 
@@ -428,7 +429,25 @@ def rlog(req_id: str, msg: str):
 
 # ─── XML tag stripping — keep content clean from tool markup ─
 
-_TOOL_TAG_RE = re.compile(r'</?\s*(?:usr_tool_calls|usr_tool_call|usr_parameter|tool_calls|tool_call|invoke|parameter|name|arguments|calls)[^>]*>')
+# Только ПОЛНЫЕ структуры tool-разметки (открывающий + закрывающий тег одного
+# имени) вырезаются из клиентского текста. Одиночный тег в прозе (например,
+# литеральное упоминание `<usr_tool_calls>`) распознанным вызовом не является
+# и выбрасываться не должен — пользовательский принцип: не-вызов не удаляем.
+_TOOL_ELEMENT_RE = re.compile(
+    r"(?:<\s*usr_tool_calls\b[^>]*>.*?</\s*usr_tool_calls\s*>"
+    r"|<\s*usr_tool_call\b[^>]*>.*?</\s*usr_tool_call\s*>"
+    r"|<\s*usr_parameter\b[^>]*>.*?</\s*usr_parameter\s*>"
+    r"|<\s*tool_calls\b[^>]*>.*?</\s*tool_calls\s*>"
+    r"|<\s*tool_call\b[^>]*>.*?</\s*tool_call\s*>"
+    r"|<\s*invoke\b[^>]*>.*?</\s*invoke\s*>"
+    r"|<\s*calls\b[^>]*>.*?</\s*calls\s*>)",
+    re.S | re.I,
+)
+
+# Открывающий тег любого семейства вызова — для детекции региона в стриме и
+# выделения нарратива до/после вызова. `\b` исключает ложные совпадения вида
+# <usr_tool_callsomething> и не требует `<` сразу перед tool_calls (usr_ префикс).
+_TOOL_OPEN_RE = re.compile(r'<\s*(?:usr_tool_call|usr_tool_calls|tool_call|tool_calls|invoke)\b')
 
 # DeepSeek's "||DSML||" service marker is a mix of U+FF5C fullwidth bars and
 # the letters "DSML". stream_sse strips it, but as a safety net purge any
@@ -443,13 +462,13 @@ def _strip_tool_tags(text: str) -> str:
     Примеры формата должны доходить до клиента нетронутыми.
     """
     if "`" not in text and "~" not in text:
-        return _TOOL_TAG_RE.sub("", text)
+        return _TOOL_ELEMENT_RE.sub("", text)
     out = []
     for seg, is_code in _code_segments(text):
         if is_code:
             out.append(seg)  # внутри фенса — не трогаем
             continue
-        out.append(_walk_outside(seg, lambda p: p, lambda p: _TOOL_TAG_RE.sub("", p)))
+        out.append(_walk_outside(seg, lambda p: p, lambda p: _TOOL_ELEMENT_RE.sub("", p)))
     return "".join(out)
 
 
@@ -541,14 +560,175 @@ def _defuse_segment(seg: str, inside: bool) -> str:
     return prefix + _SPAN_TOOL_TAG_RE.sub(lambda mm: "`" + " " * (len(mm.group(0)) - 2) + "`", seg)
 
 
-def _mask_code_fences(text: str) -> str:
+def _mask_code_fences(text: str, keep_vyzov: bool = False) -> str:
     """Внутри код-блоков и инлайн-спанов заменяет 'tool' на 't00l'.
 
     Длина сохраняется — смещения совпадают с оригиналом.
+    keep_vyzov=True — содержимое блоков ```Вызов ... ``` маски НЕ ИМЕЕТ:
+    это реальные инструментальные вызовы (см. tool_coll_header, Шаг 3).
     """
     if "`" not in text and "~" not in text:
         return text
+    if keep_vyzov:
+        spans = _vyzov_block_spans(text)
+        if not spans:
+            return "".join(_defuse_segment(seg, code) for seg, code in _code_segments(text))
+        out = []
+        pos = 0
+        for s, e in spans:
+            out.append(_mask_code_fences(text[pos:s]))
+            out.append(text[s:e])  # блок вызова остаётся нетронутым
+            pos = e
+        out.append(_mask_code_fences(text[pos:]))
+        return "".join(out)
     return "".join(_defuse_segment(seg, code) for seg, code in _code_segments(text))
+
+
+def _call_block_is_call(text: str, start: int, end: int) -> bool:
+    """Есть ли в body[start:end] tool-тег НА УРОВНЕ блока: вне вложенных код-блоков.
+
+    Вложенные код-блоки (в т.ч. демонстрация с двойным экранированием —
+    ```` вокруг ```Вызов с XML) реальным вызовом не считаются. Для этого body
+    сегментируется по фенсам, и tool-тег ищется только в ВНЕ-кодовых сегментах.
+    """
+    body = text[start:end]
+    for seg, is_code in _code_segments(body):
+        if not is_code and _TOOL_OPEN_RE.search(seg):
+            return True
+    return False
+
+
+def _vyzov_block_spans(text: str) -> list[tuple[int, int]]:
+    """Диапазоны (start, end) завершённых код-блоков ВЕРХНЕГО УРОВНЯ, содержимое
+    которых является инструментальным вызовом (включая фенсы).
+
+    Правило контентное: блок ```Вызов ... ```, ```xml <usr_tool_calls> ... ```,
+    а также просто ``` ... ``` (любая инфо-строка) становятся регионами вызова,
+    если внутри есть tool-тег (`<usr_tool_calls`, `<tool_call`, `<invoke`, ...)
+    НА УРОВНЕ БЛОКА. Тильда-фенсы (~~~) — всегда примеры. Вложенный блок
+    (двойное экранирование — демонстрация) таковым НЕ считается. Закрывающим
+    считается фенс того же символа и не короче открывающего. Незакрытый код-блок
+    верхнего уровня с tool-тегом тоже считается вызовом (обрыв на EOF).
+    """
+    spans: list[tuple[int, int]] = []
+    in_block = False
+    block_start = 0
+    open_len = 0
+    open_ch = ""
+    info_end = 0
+    for m in _FENCE_RUN_RE.finditer(text):
+        run = m.group().lstrip()
+        ch = run[0]
+        ln = len(run)
+        if not in_block:
+            in_block = True
+            block_start = m.start()
+            open_len = ln
+            open_ch = ch
+            nl = text.find("\n", m.end())
+            info_end = nl + 1 if nl != -1 else len(text)
+            continue
+        if ch == open_ch and ln >= open_len:
+            if open_ch == "`" and _call_block_is_call(text, info_end, m.start()):
+                spans.append((block_start, m.end()))
+            in_block = False
+    if in_block and open_ch == "`" and _call_block_is_call(text, info_end, len(text)):
+        spans.append((block_start, len(text)))
+    return spans
+
+
+def _find_vyzov_open(text: str):
+    """Позиция начала первого код-блока верхнего уровня, чьё содержимое — уже
+    похоже на вызов (есть tool-тег на уровне блока), иначе None.
+
+    Срабатывает ДО закрывающего фенса (по мере накопления тела). Вложенный код-
+    блок (двойное экранирование) вызовом не является; тильда-фенсы — никогда.
+    """
+    in_block = False
+    block_start = 0
+    open_len = 0
+    open_ch = ""
+    info_end = 0
+    for m in _FENCE_RUN_RE.finditer(text):
+        run = m.group().lstrip()
+        ch = run[0]
+        ln = len(run)
+        if in_block:
+            if open_ch == "`" and _call_block_is_call(text, info_end, m.start()):
+                return block_start
+            if ch == open_ch and ln >= open_len:
+                in_block = False
+            continue
+        in_block = True
+        block_start = m.start()
+        open_len = ln
+        open_ch = ch
+        nl = text.find("\n", m.end())
+        info_end = nl + 1 if nl != -1 else len(text)
+    if in_block and open_ch == "`" and _call_block_is_call(text, info_end, len(text)):
+        return block_start
+    return None
+
+
+def _span_containing(spans: list[tuple[int, int]], pos: int):
+    """(start, end) блока Вызов, содержащего позицию pos, иначе None."""
+    for s, e in spans:
+        if s <= pos <= e:
+            return (s, e)
+    return None
+
+
+def _closing_fence_re(text: str, pos: int):
+    """Regex закрывающего фенса для блока, начинающегося на позиции pos.
+
+    pos указывает на строку открывающего фенса (начало строки). Вернёт скомпи-
+    лированный regex или None, если на pos блок Вызов не начинается.
+    """
+    m = _FENCE_RUN_RE.match(text, pos)
+    if not m:
+        return None
+    run = m.group().lstrip()
+    ch = run[0]
+    n = len(run)
+    return re.compile(r"(?m)^[ \t]{0,3}(?:" + re.escape(ch) + r"{" + str(n) + r",})")
+
+
+def _strip_leading_fence(text: str) -> str:
+    """Отрезает первую строку буфера региона, если она — открывающий фенс
+    (```Вызов, ```xml, ```, ...). Остальное содержимое сохраняется целиком."""
+    m = _FENCE_RUN_RE.match(text)
+    if not m:
+        return text
+    nl = text.find("\n", m.end())
+    return text[nl + 1:] if nl != -1 else ""
+
+
+def _strip_vyzov_blocks(text: str) -> str:
+    """Вырезает ЦЕЛИКОМ (вместе с фенсами) все завершённые блоки-вызовы
+    верхнего уровня (контентное правило: внутри есть tool-тег)."""
+    spans = _vyzov_block_spans(text)
+    if not spans:
+        return text
+    out = []
+    pos = 0
+    for s, e in spans:
+        out.append(text[pos:s])
+        pos = e
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _tool_region_end(masked: str, start: int) -> int:
+    """Индекс конца инструментального региона после позиции start.
+
+    Для сырого XML — конец последнего закрывающего тега семейства tool-тегов;
+    region внутри блока Вызов закрывается фенсом (обрабатывает вызывающий код).
+    """
+    last = 0
+    for c in re.finditer(r'</\s*(?:usr_tool_calls?|usr_parameter|tool_calls|tool_call|invoke)\b[^>]*>',
+                         masked[start:]):
+        last = c.end()
+    return start + last if last else len(masked)
 
 PREFIX = "dsf-"
 
@@ -746,20 +926,40 @@ def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) ->
         for t in tools:
             func = t.get("function", {})
             name = func.get("name", "unknown")
-#            if name == "tool_call":
-#                # Служебный тег-инструмент (описывает формат вызова) — в списке
-#                # тулов не выводим, чтобы не путать модель.
-#                continue
-            desc = func.get("description", "")
-            params = func.get("parameters", {})
+            if name == "tool_call":
+                desc =  "Invoke a deferred tool. Pass `name` (the exact tool name) and " \
+                        "`arguments` (an object matching that tool's schema) as two " \
+                        "top-level parameters — one invocation per tool_call." \
+                        "Local tools: one invocation per tool_call." \
+                        "Argument shapes match each tool's schema (see `tool_describe`). " \
+                        "Policy, hooks, and approvals run as for directly-listed tools."
+                params = {
+                              "type": "object",
+                              "properties":
+                                  {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Exact tool name to invoke. Preferred form.",
+                                    },
+                                    "arguments": {
+                                        "type": "object",
+                                        "description": "Arguments matching the tool schema. A JSON string is also accepted and parsed.",
+                                    }
+                                  },
+                              "required":["name", "arguments"]
+                        }
+            else:
+                desc = func.get("description", "")
+                params = func.get("parameters", {})
             schema = _format_full_schema(params)
             immediate_descs.append(f"  - {name}: {_fix_tool_desc(desc)}\n    params: {_fix_tool_desc(schema)}")
 
-        tool_header = tool_coll_header + "You have access to the following tools:" + chr(10)
+        tool_header = tool_coll_header + chr(10)
+        tool_header += chr(10) + "You have access to the following tools:" + chr(10)
 
         if immediate_descs:
             tool_header += "# Available tools:" + chr(10)
-            tool_header += chr(10).join(immediate_descs) + chr(10)
+            tool_header += (chr(10) * 2).join(immediate_descs) + chr(10)
         tool_header += chr(10)
         parts.insert(0, tool_header)
     lt = chr(60)
@@ -905,12 +1105,15 @@ def openai_tool_calls_response(chunk_id, created, model, tool_calls):
 def parse_tool_calls(text, available_tools=None):
     """Parse tool calls from LLM text output.
 
-    Разметка внутри ```-блоков обезвреживается (tool -> t00l): примеры
-    формата в код-блоках не являются реальными вызовами.
+    Вызовы ищутся и внутри код-блоков ```Вызов ... ```, ```xml ... ``` и просто
+    ``` ... ```: любой код-блок верхнего уровня, содержащий tool-тег на своём
+    уровне, — реальный вызов (см. tool_coll_header Шаг 3); его содержимое маски
+    НЕ ИМЕЕТ. Вложенные код-блоки (двойное экранирование) и тильда-фенсы (~~~)
+    обезвреживаются — примеры формата реальными вызовами не являются.
     """
     import re, json
     if MASK_CODE_FENCES:
-        text = _mask_code_fences(text)
+        text = _mask_code_fences(text, keep_vyzov=True)
     text = _normalize_spaced_tags(text)
     tool_calls = []
     available_names = set()
@@ -1288,7 +1491,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             prev_text = prev.get("content") or ""
             if isinstance(prev_text, list):
                 prev_text = "\n".join(item.get("text", "") for item in prev_text if item.get("type") == "text")
-            _masked_prev = _mask_code_fences(prev_text) if MASK_CODE_FENCES else prev_text
+            _masked_prev = _mask_code_fences(prev_text, keep_vyzov=True) if MASK_CODE_FENCES else prev_text
             if re.search(r'<usr_tool_call\s+name=', _masked_prev) or re.search(r'<tool_call\s+name=', _masked_prev) or re.search(r'<invoke\s+name=', _masked_prev) or re.search(r'<tool_call>\s*<name>', _masked_prev):
                 is_tool_result = True
                 rlog(req_id, f"DETECT: prev assistant (via scan) has tool_call XML → tool_result")
@@ -1451,7 +1654,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 think_text = ""        # accumulated thinking content
                 text_buf = ""          # text to send as content
                 in_tool_call = False   # true once we detect a tool call starting
-                tool_text_buf = ""     # accumulated tool call XML
+                tool_text_buf = ""     # accumulated tool call region (Вызов-block/XML)
+                tool_fence_re = None   # closing fence regex of the current Вызов block
 
                 def on_thinking_chunk(text: str):
                     nonlocal think_text
@@ -1462,27 +1666,56 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                     on_chunk(openai_chunk(chunk_id, created, model, "", None, reasoning_content=text))
 
                 def on_text_chunk(text: str):
-                    nonlocal full_text, text_buf, in_tool_call, tool_text_buf
+                    nonlocal full_text, text_buf, in_tool_call, tool_text_buf, tool_fence_re
                     text = _DSML_GLUE_RE.sub("", text)
                     full_text += text
 
                     if in_tool_call:
                         tool_text_buf += text
+                        if tool_fence_re:
+                            # Первая строка буфера — это открывающий фенс ```Вызов```;
+                            # закрывающий фенс ищем после неё, чтобы не выйти сразу.
+                            nl = tool_text_buf.find("\n")
+                            search_from = nl + 1 if nl != -1 else len(tool_text_buf)
+                            mc = tool_fence_re.search(tool_text_buf, search_from)
+                            if mc:
+                                tail = tool_text_buf[mc.end():]
+                                # Регион (фенсы + тело) не выбрасывается: не-вызов
+                                # не должен пропадать из ответа. По порядку —
+                                # сначала регион, затем хвост.
+                                text_buf += tool_text_buf[:mc.end()]
+                                tool_text_buf = ""
+                                in_tool_call = False
+                                tool_fence_re = None
+                                if tail:
+                                    text_buf += tail
                         return
 
                     # Check accumulated context for cross-chunk tool call detection.
-                    # Поиск ведётся по обезвреженной копии (длина совпадает с
-                    # оригиналом, смещения валидны): разметка внутри фенсов
-                    # невидима и не останавливает стрим.
+                    # Вызовы живут внутри блоков ```Вызов``` (tool_coll_header Шаг 3):
+                    # регион открывает строка самого фенса — с неё и буферизуем, а
+                    # закрывающий фенс завершает регион. Сырой XML вне блоков (старый
+                    # формат) ловится по открывающему тегу и буферизуется до конца.
+                    # Длина обезвреженной копии совпадает — смещения валидны.
                     context = text_buf + text
-                    ctx = _mask_code_fences(context) if MASK_CODE_FENCES else context
-                    m = re.search(r'<\s*(?:invoke|tool_calls?)[\s>]', ctx)
-                    if m:
-                        tool_start = m.start()
-                        before = _strip_tool_tags(context[:tool_start])
-                        if before:
-                            on_chunk(openai_chunk(chunk_id, created, model, before, None))
-                        tool_text_buf = context[tool_start:]
+                    ctx = _mask_code_fences(context, keep_vyzov=True) if MASK_CODE_FENCES else context
+                    tool_fence = None
+                    tool_start = _find_vyzov_open(ctx)
+                    if tool_start is not None:
+                        tool_fence = _closing_fence_re(ctx, tool_start)
+                    else:
+                        m2 = _TOOL_OPEN_RE.search(ctx)
+                        if m2:
+                            span = _span_containing(_vyzov_block_spans(ctx), m2.start())
+                            tool_start = span[0] if span else m2.start()
+                            tool_fence = _closing_fence_re(ctx, tool_start)
+                    if tool_start is not None:
+                        # Строка фенса/тега могла прийти обрывками — огрызок строки в
+                        # text_buf (до начала полной строки) выбрасываем.
+                        ls = context.rfind("\n", 0, tool_start)
+                        text_buf = context[:ls + 1] if ls != -1 else ""
+                        tool_text_buf = ctx[tool_start:]
+                        tool_fence_re = tool_fence
                         in_tool_call = True
                     else:
                         text_buf += text
@@ -1513,31 +1746,60 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
                 if had_tool_call:
                     rlog(req_id, f"TOOL CALLS detected ({len(tool_calls)}): {json.dumps(tool_calls, ensure_ascii=False)}")
-                    # If mid-stream didn't fire, send text before first tool call now
-                    if not in_tool_call:
-                        masked_full = _mask_code_fences(full_text) if MASK_CODE_FENCES else full_text
-                        m = re.search(r'<\s*(?:invoke|tool_call|tool_calls)[\s>]', masked_full)
+                    # Нарратив до/после инструментального региона. Регион — либо
+                    # весь блок ```Вызов ... ``` (вместе с фенсами), либо сырой XML.
+                    masked_full = _mask_code_fences(full_text, keep_vyzov=True) if MASK_CODE_FENCES else full_text
+                    spans = _vyzov_block_spans(masked_full)
+                    region = None
+                    # Регион — первый блок Вызов верхнего уровня, внутри которого
+                    # есть tool-тег. Литеральное упоминание <usr_tool_calls> в прозе
+                    # (вне блока) регионом не является.
+                    for s, e in spans:
+                        if _TOOL_OPEN_RE.search(masked_full, s, e):
+                            region = (s, e)
+                            break
+                    if region is None:
+                        m = _TOOL_OPEN_RE.search(masked_full)
                         if m:
-                            before = _strip_tool_tags(full_text[:m.start()])
-                            if before:
-                                chunk_str = openai_chunk(chunk_id, created, model, before, None)
-                                rlog(req_id, f"STREAM CHUNK: text_before_tool ({len(before)} chars)  size={len(chunk_str)}")
-                                on_chunk(chunk_str)
+                            region = (m.start(), _tool_region_end(masked_full, m.start()))
+                    if region:
+                        region_start, region_end = region
+                        before = full_text[:region_start]
+                        if before:
+                            before = _strip_tool_tags(before)
+                            chunk_str = openai_chunk(chunk_id, created, model, before, None)
+                            rlog(req_id, f"STREAM CHUNK: text_before_tool ({len(before)} chars)  size={len(chunk_str)}")
+                            on_chunk(chunk_str)
+                        tail = _strip_tool_tags(_strip_vyzov_blocks(full_text[region_end:])).lstrip("\n")
+                        if tail:
+                            chunk_str = openai_chunk(chunk_id, created, model, tail, None)
+                            rlog(req_id, f"STREAM CHUNK: text_after_tool ({len(tail)} chars)  size={len(chunk_str)}")
+                            on_chunk(chunk_str)
+                    else:
+                        rlog(req_id, "TOOL CALL PARSE edge: tool tags not found in masked text — regions skipped")
                     # All tool calls in one chunk with correct indices
                     chunk_str = openai_tool_calls_chunk(chunk_id, created, model, tool_calls)
                     names = [tc['name'] for tc in tool_calls]
                     rlog(req_id, f"STREAM CHUNK: tool_calls({len(tool_calls)}) names={names} size={len(chunk_str)}\n{chunk_str.rstrip()}")
                     on_chunk(chunk_str)
                 elif in_tool_call:
-                    # Mid-stream detected tool call but parsing failed
-                    rlog(req_id, f"TOOL CALL PARSE FAILED — sending as filtered text")
-                    remaining = _strip_tool_tags(tool_text_buf)
-                    rlog(req_id, f"STREAM CHUNK: filtered_text raw={len(tool_text_buf)} sent={len(remaining)}\n{remaining[:1500]}")
+                    # Mid-stream detected tool call but parsing failed.
+                    # Принцип: распознанного вызова нет — текст НЕ выбрасываем.
+                    # До региона нарратив мог накопиться в text_buf — его нужно
+                    # отдать первым, иначе начало ответа пропадёт.
+                    before = text_buf
+                    rlog(req_id, f"TOOL CALL PARSE FAILED — sending as text")
+                    if before:
+                        chunk_str = openai_chunk(chunk_id, created, model, before, None)
+                        rlog(req_id, f"STREAM CHUNK: text_before_region raw={len(text_buf)} sent={len(before)}")
+                        on_chunk(chunk_str)
+                    remaining = _strip_leading_fence(tool_text_buf)
+                    rlog(req_id, f"STREAM CHUNK: region_as_text raw={len(tool_text_buf)} sent={len(remaining)}\n{remaining[:1500]}")
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
                 else:
-                    # No tool calls — flush all buffered text
-                    remaining = _strip_tool_tags(text_buf)
+                    # No tool calls — flush all buffered text verbatim
+                    remaining = text_buf
                     rlog(req_id, f"STREAM CHUNK: flush_text raw={len(text_buf)} sent={len(remaining)}\n{remaining[:1500]}")
                     if remaining:
                         on_chunk(openai_chunk(chunk_id, created, model, remaining, None))
