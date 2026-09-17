@@ -8,11 +8,29 @@ log = logging.getLogger("ds")
 
 # DeepSeek wraps tool-call tags with a fullwidth-bars marker "||DSML||"
 # (U+FF5C x2 + "DSML" + U+FF5C x2). It is a service delimiter that must not
-# reach the client. It never arrives split across tokens, so it can be
-# stripped on the fly as events are received. The marker may arrive padded
-# with whitespace around it — strip that too, it is part of the marker.
+# reach the client. The marker may arrive padded with whitespace around it
+# and can be split across consecutive SSE events (e.g. "<", "｜", "｜", "DS",
+# "ML", "｜", "｜", " invoke"), so it is stitched across events before being
+# stripped.
 _DSML_MARKER = "\uff5c\uff5cDSML\uff5c\uff5c"
 _DSML_MARKER_RE = re.compile(r"\s*" + re.escape(_DSML_MARKER) + r"\s*")
+
+
+def _strip_dsml(chunk: str, pending: str) -> tuple[str, str]:
+    """Strip DSML markers from a chunk, tolerating markers split across chunks.
+
+    Prepends the leftover tail of the previous chunk (`pending`) to `chunk`,
+    removes every complete marker, and returns (text_to_emit, new_pending).
+    The tail may be the start of a marker that is still arriving, so it is
+    kept until the next chunk (or the end of the stream) decides whether it
+    completes a marker.
+    """
+    cleaned = _DSML_MARKER_RE.sub("", pending + chunk)
+    hold = ""
+    for k in range(1, len(_DSML_MARKER)):
+        if cleaned.endswith(_DSML_MARKER[:k]):
+            hold = cleaned[-k:]
+    return cleaned[: len(cleaned) - len(hold)], hold
 
 
 class DeepSeekError(Exception):
@@ -188,6 +206,8 @@ async def stream_sse(
     fragments: dict[str, str] = {}
     buffer = ""
     sse_count = 0
+    pending_text = ""
+    pending_think = ""
 
     async for line in response.aiter_text():
         buffer += line
@@ -227,15 +247,24 @@ async def stream_sse(
                 if on_message_id:
                     on_message_id(msg_id)
             if text:
-                text = _DSML_MARKER_RE.sub("", text)
+                text, pending_text = _strip_dsml(text, pending_text)
                 full_text += text
-                if on_text:
+                if text and on_text:
                     on_text(text)
             if thinking:
-                thinking = _DSML_MARKER_RE.sub("", thinking)
+                thinking, pending_think = _strip_dsml(thinking, pending_think)
                 full_thinking += thinking
-                if on_thinking:
+                if thinking and on_thinking:
                     on_thinking(thinking)
+
+    if pending_text:
+        full_text += pending_text
+        if on_text:
+            on_text(pending_text)
+    if pending_think:
+        full_thinking += pending_think
+        if on_thinking:
+            on_thinking(pending_think)
 
     if debug:
         log.debug(f"[REQ-{req_id}] SSE done — {sse_count} events, {len(full_text)} chars text, {len(full_thinking)} chars thinking")

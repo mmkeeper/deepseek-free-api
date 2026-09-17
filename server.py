@@ -430,6 +430,12 @@ def rlog(req_id: str, msg: str):
 
 _TOOL_TAG_RE = re.compile(r'</?\s*(?:usr_tool_calls|usr_tool_call|usr_parameter|tool_calls|tool_call|invoke|parameter|name|arguments|calls)[^>]*>')
 
+# DeepSeek's "||DSML||" service marker is a mix of U+FF5C fullwidth bars and
+# the letters "DSML". stream_sse strips it, but as a safety net purge any
+# leftover marker fragment from content while streaming so it can never leak
+# to the client or glue into tool tags and break detection/parsing.
+_DSML_GLUE_RE = re.compile(r"[\uff5cDSML]+\uff5c[\uff5cDSML]*|\uff5c[\uff5cDSML]+|\uff5c")
+
 
 def _strip_tool_tags(text: str) -> str:
     """Вырезает tool-разметку вне код-блоков (``` и ~~~) и вне `инлайн-кода`.
@@ -928,9 +934,16 @@ def parse_tool_calls(text, available_tools=None):
 
     def _parse_props(txt):
         result = {}
-        param_pat_usr = '<usr_parameter\\s+name="([^"]+)"[^>]*>(.*?)</usr_parameter>'
-        param_pat = '<parameter\\s+name="([^"]+)"[^>]*>(.*?)</parameter>'
-        param_pat2 = '<param\\s+name="([^"]+)"[^>]*>(.*?)</param>'
+        # Значение параметра заканчивается на первом из: закрывающего тега
+        # этого семейства (устойчиво к опечаткам вида `</us_parameter>` вместо
+        # `</usr_parameter>`), следующего открывающего тега параметра/вызова
+        # или конца текста. Без этого ленивый `.*?` при опечатке в закрытии
+        # пожирает весь остаток XML-блока как значение одного параметра.
+        param_end = (r'(?=</\s*\w*_?(?:parameter|param)\s*>'
+                     r'|<\s*(?:usr_parameter|parameter|param|usr_tool_call|invoke)\b|$)')
+        param_pat_usr = '<usr_parameter\\s+name="([^"]+)"[^>]*>(.*?)' + param_end
+        param_pat = '<parameter\\s+name="([^"]+)"[^>]*>(.*?)' + param_end
+        param_pat2 = '<param\\s+name="([^"]+)"[^>]*>(.*?)' + param_end
         for pat in (param_pat_usr, param_pat):
             for m in re.finditer(pat, txt, re.DOTALL):
                 result[m.group(1)] = _clean(m.group(2))
@@ -954,14 +967,16 @@ def parse_tool_calls(text, available_tools=None):
 
     # Format 0: usr_-prefixed taught format (current):
     # <usr_tool_calls> / <usr_tool_call name="..."> / <usr_parameter name="...">value</usr_parameter>
-    for m in re.finditer('<usr_tool_call\\s+name="([^"]+)"[^>]*>(.*?)</usr_tool_call>', text, re.DOTALL):
+    call_end = (r'(?=</\s*\w*_?tool_call\s*>'
+                r'|<\s*(?:usr_tool_call|usr_tool_calls)\b|$)')
+    for m in re.finditer('<usr_tool_call\\s+name="([^"]+)"[^>]*>(.*?)' + call_end, text, re.DOTALL):
         name, props = m.group(1), m.group(2)
         if _valid(name):
             args = _parse_props(props) or {}
             tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
     # Format 1: invoke with parameter tags
-    for m in re.finditer('<invoke name="([^"]+)">(.*?)</invoke>', text, re.DOTALL):
+    for m in re.finditer('<invoke name="([^"]+)"[^>]*>(.*?)</invoke>', text, re.DOTALL):
         name, props = m.group(1), m.group(2)
         if _valid(name):
             args = _parse_props(props)
@@ -972,7 +987,7 @@ def parse_tool_calls(text, available_tools=None):
     if not tool_calls:
         tc = re.search('<tool_calls>(.*?)</tool_calls>', text, re.DOTALL)
         if tc:
-            for m in re.finditer('<invoke name="([^"]+)">(.*?)</invoke>', tc.group(1), re.DOTALL):
+            for m in re.finditer('<invoke name="([^"]+)"[^>]*>(.*?)</invoke>', tc.group(1), re.DOTALL):
                 name, props = m.group(1), m.group(2)
                 if _valid(name):
                     args = _parse_props(props)
@@ -1014,7 +1029,7 @@ def parse_tool_calls(text, available_tools=None):
 
     # Format 6: tag with JSON content
     if not tool_calls:
-        for m in re.finditer('<(\\w+)>\\s*(\\{.*?\\})\\s*</\\1>', text, re.DOTALL):
+        for m in re.finditer('<\\s*(\\w+)[^>]*>\\s*(\\{.*?\\})\\s*</\\1>', text, re.DOTALL):
             name = m.group(1)
             try:
                 p = json.loads(m.group(2))
@@ -1027,7 +1042,7 @@ def parse_tool_calls(text, available_tools=None):
 
     # Format 8: colon-separated tag
     if not tool_calls:
-        for m in re.finditer('<(\\w+):(\\w+)>(.*?)</\\1:\\2>', text):
+        for m in re.finditer('<(\\w+):(\\w+)[^>]*>(.*?)</\\1:\\2>', text):
             tool_name, param_name, value = m.group(1), m.group(2), _clean(m.group(3))
             if value and _valid(tool_name):
                 tool_calls.append({"name": tool_name, "arguments": json.dumps({param_name: value})})
@@ -1041,7 +1056,7 @@ def parse_tool_calls(text, available_tools=None):
             tool_calls.append({"name": name, "arguments": json.dumps(args)})
 
     # Format 10: nested elements <tool_call><name>X</name><arguments><p>v</p></arguments></tool_call>
-    for m in re.finditer(r'<tool_call>\s*<name>([^<]+)</name>(.*?)</tool_call>', text, re.DOTALL):
+    for m in re.finditer(r'<tool_call\s*[^>]*>\s*<name>([^<]+)</name>(.*?)</tool_call>', text, re.DOTALL):
         name, body = m.group(1), m.group(2)
         if _valid(name):
             am = re.search(r'<arguments>(.*?)</arguments>', body, re.DOTALL)
@@ -1064,12 +1079,12 @@ def parse_tool_calls(text, available_tools=None):
     if not tool_calls:
         tc = re.search(r'<tool_calls>(.*?)</tool_calls>', text, re.DOTALL)
         if tc:
-            for m in re.finditer(r'<([^/>\s]+)>(.*?)</\1>', tc.group(1), re.DOTALL):
+            for m in re.finditer(r'<([^/>\s]+)[^>]*>(.*?)</\1>', tc.group(1), re.DOTALL):
                 name, body = m.group(1), m.group(2)
                 if not _valid(name):
                     continue
                 args = {}
-                for pm in re.finditer(r'<([^/>\s]+)>(.*?)</\1>', body, re.DOTALL):
+                for pm in re.finditer(r'<([^/>\s]+)[^>]*>(.*?)</\1>', body, re.DOTALL):
                     args[pm.group(1)] = _clean(pm.group(2))
                 if not args:
                     try:
@@ -1448,6 +1463,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
                 def on_text_chunk(text: str):
                     nonlocal full_text, text_buf, in_tool_call, tool_text_buf
+                    text = _DSML_GLUE_RE.sub("", text)
                     full_text += text
 
                     if in_tool_call:

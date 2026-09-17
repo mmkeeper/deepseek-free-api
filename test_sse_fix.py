@@ -187,6 +187,56 @@ def test_dsml_marker_padded_with_spaces_filtered():
     assert joined == "<invoke name=foo>", f"marker padding spaces left behind: {joined!r}"
 
 
+def test_dsml_marker_split_across_events_filtered():
+    """Marker split across SSE token boundaries is still stripped.
+
+    DeepSeek sometimes delivers the ||DSML|| delimiter one token at a time
+    (e.g. "<", bar, bar, "DS", "ML", bar, bar, " invoke"). The strip must
+    stitch consecutive events, not just match a whole marker in one event.
+    """
+    import asyncio
+    import json
+    from src.sse import stream_sse
+
+    bar = "\uff5c"
+
+    class FakeResp:
+        async def aiter_text(self):
+            for piece in [
+                "<", bar, bar, "DS", "ML", bar, bar, " invoke",
+                ' name="skill_view">',
+                "<", bar, bar, "DS", "ML", bar, bar, 'parameter name="name">',
+                "</parameter>",
+                "<", bar, bar, "DS", "ML", bar, bar, "/invoke>",
+            ]:
+                yield f'data: {json.dumps({"v": piece})}\n\n'
+
+    out_text, _ = [], []
+    asyncio.run(stream_sse(FakeResp(), on_text=out_text.append))
+    joined = "".join(out_text)
+    assert bar not in joined, f"DSML bar leaked: {joined!r}"
+    assert "DSML" not in joined, f"DSML letters leaked: {joined!r}"
+    assert joined == '< invoke name="skill_view"><parameter name="name"></parameter></invoke>', joined
+
+
+def test_dsml_marker_split_across_event_and_end_flushed():
+    """Trailing partial marker that never completes is emitted as literal text."""
+    import asyncio
+    from src.sse import stream_sse
+
+    bar = "\uff5c"
+
+    class FakeResp:
+        async def aiter_text(self):
+            yield f'data: {{"v": "text {bar}"}}\n\n'
+            yield f'data: {{"v": "{bar}"}}\n\n'
+
+    out_text, _ = [], []
+    asyncio.run(stream_sse(FakeResp(), on_text=out_text.append))
+    joined = "".join(out_text)
+    assert joined == "text " + bar + bar, f"unfinished marker tail must be flushed as text, got: {joined!r}"
+
+
 if __name__ == "__main__":
     tests = [
         test_think_snapshot_delta,
@@ -200,6 +250,8 @@ if __name__ == "__main__":
         test_dsml_marker_filtered_from_text,
         test_dsml_marker_filtered_from_thinking,
         test_dsml_marker_padded_with_spaces_filtered,
+        test_dsml_marker_split_across_events_filtered,
+        test_dsml_marker_split_across_event_and_end_flushed,
     ]
     for t in tests:
         try:

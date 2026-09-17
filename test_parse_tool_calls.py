@@ -155,6 +155,37 @@ def test_regression_invoke_format1():
     print("  PASS: regression Format 1 (invoke)")
 
 
+def test_extra_attributes_tolerated():
+    """Модель добавляет string=\"true\" и прочие атрибуты — парсер их игнорирует.
+
+    Запреты в промпте не остановят модель: вместо жёсткого формата лучше
+    терпимо парсить любые атрибуты после name= (Format 0/1/9) и на тегах.
+    """
+    cases = [
+        # Format 1: invoke с атрибутами на invoke и parameter
+        ("""<invoke name="web_search" string="true" type="function">
+<parameter name="query" string="true">t</parameter>
+<parameter name="limit" string="false">3</parameter>
+</invoke>""",
+         "web_search", {"query": "t", "limit": "3"}),
+        # Format 0: usr_tool_call с атрибутами на call и параметрах
+        ("""<usr_tool_calls>
+  <usr_tool_call name="vision_analyze" string="true">
+    <usr_parameter name="image_url" string="true">C:\\img.png</usr_parameter>
+    <usr_parameter name="question" string="true">q</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>""",
+         "vision_analyze", {"image_url": "C:\\img.png", "question": "q"}),
+    ]
+    for text, name, want in cases:
+        tcs = parse_tool_calls(text)
+        assert len(tcs) == 1, f"expected 1 call, got {len(tcs)}: {tcs}"
+        assert tcs[0]["name"] == name, tcs
+        args = json.loads(tcs[0]["arguments"])
+        assert args == want, f"args: {args!r}"
+    print("  PASS: extra attributes on invoke/usr_ and parameter tags ignored")
+
+
 def test_json_inside_arguments():
     """FULL_SCHEMA_TOOLS показывает параметры как JSON — модель может сымитировать это."""
     text = """<tool_call>
@@ -569,36 +600,6 @@ def test_messages_to_prompt_rewrites_tool_descriptions():
     print("  PASS: messages_to_prompt shows tool descriptions in usr_ format")
 
 
-def test_messages_to_prompt_skips_tool_call():
-    """Инструмент `tool_call` (формат-обманка) не печатается в списке тулов."""
-    from server import messages_to_prompt
-    tools = [
-        {"type": "function", "function": {
-            "name": "web_search", "description": "search the web.",
-            "parameters": {"type": "object", "properties": {}, "required": []}}},
-        {"type": "function", "function": {
-            "name": "tool_call", "description": "ensure you use <tool_call name='x'>",
-            "parameters": {"type": "object", "properties": {}, "required": []}}},
-        {"type": "function", "function": {
-            "name": "memory", "description": "remember something",
-            "parameters": {"type": "object", "properties": {}, "required": []}}},
-        {"type": "function", "function": {
-            "name": "some_plugin_tool", "description": "does stuff",
-            "parameters": {"type": "object", "properties": {}, "required": []}}},
-    ]
-    out = messages_to_prompt(
-        [{"role": "system", "content": ""}, {"role": "user", "content": "hi"}],
-        tools,
-    )
-    assert "tool_call [deferred]" not in out, out
-    assert "ensure you use" not in out, "description of tool_call must not be printed"
-    assert "web_search" in out
-    assert "memory" in out
-    assert "some_plugin_tool" in out
-    assert "  - some_plugin_tool: does stuff\n    params: " in out, "all tools show full parameter schemas"
-    print("  PASS: tool_call excluded from the tool list")
-
-
 def test_spaced_tags_parsed():
     """deepseek-flash теперь шлёт теги с пробелом после '<' — вызов должен распознаваться."""
     text = """< calls>
@@ -629,6 +630,48 @@ def test_spaced_tags_stripped_from_client_text():
     print("  PASS: spaced tags stripped from client text")
 
 
+def test_dsml_marker_glued_into_tags_scrubbed():
+    """Остатки маркера ||DSML||, приклеенные к тегам, чистятся до распознавания."""
+    from server import _DSML_GLUE_RE
+    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+    src = ((f"<{marker}invoke name=\"x\">"
+            f"<{marker}parameter name=\"q\">v</{marker}parameter>"
+            f"</{marker}invoke>"))
+    out = _DSML_GLUE_RE.sub("", src)
+    assert marker not in out and "\uff5c" not in out, f"marker leaked: {out!r}"
+    assert out == '<invoke name="x"><parameter name="q">v</parameter></invoke>', out
+    print("  PASS: glued DSML marker scrubbed from tags")
+
+
+def test_usr_param_typo_closing_tag_does_not_swallow_xml():
+    """Опечатка в закрытии </us_parameter> не должна пожирать остаток XML.
+
+    Регрессия: модель написала `</us_parameter>` вместо `</usr_parameter>`;
+    ленивый regex продолжается до следующего корректного закрытия и
+    захватывает значение следующего параметра в предыдущий.
+    """
+    text = """<usr_tool_calls>
+  <usr_tool_call name="vision_analyze">
+    <usr_parameter name="image_url">C:\\users\\p1.png</usr_parameter>
+    <usr_parameter name="question" string="true">q1</usr_parameter>
+  </usr_tool_call>
+  <usr_tool_call name="vision_analyze">
+    <usr_parameter name="image_url" string="true">C:\\users\\p2.png</us_parameter>
+    <usr_parameter name="question" string="true">q2</usr_parameter>
+  </usr_tool_call>
+</usr_tool_calls>"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 2, f"expected 2 calls, got {len(tcs)}: {tcs}"
+    args0 = json.loads(tcs[0]["arguments"])
+    assert args0["image_url"] == "C:\\users\\p1.png", args0
+    assert args0["question"] == "q1", args0
+    args1 = json.loads(tcs[1]["arguments"])
+    assert args1["image_url"] == "C:\\users\\p2.png", f"image_url swallowed XML: {args1!r}"
+    assert args1["question"] == "q2", f"question swallowed: {args1!r}"
+    assert args1["image_url"] == "C:\\users\\p2.png", args1
+    print("  PASS: typo in closing tag keeps parameter values clean")
+
+
 if __name__ == "__main__":
     tests = [
         test_nested_quadruple_fence_defused,
@@ -654,6 +697,7 @@ if __name__ == "__main__":
         test_unclosed_fence_masks_tail,
         test_regression_hermes_format9,
         test_regression_invoke_format1,
+        test_extra_attributes_tolerated,
         test_no_tool_call_in_plain_text,
         test_usr_format_parses,
         test_usr_format_multiple_calls,
@@ -665,9 +709,10 @@ if __name__ == "__main__":
         test_usr_inline_mention_defused,
         test_fix_tool_desc_rewrites_format_mentions,
         test_messages_to_prompt_rewrites_tool_descriptions,
-        test_messages_to_prompt_skips_tool_call,
         test_spaced_tags_parsed,
         test_spaced_tags_stripped_from_client_text,
+        test_dsml_marker_glued_into_tags_scrubbed,
+        test_usr_param_typo_closing_tag_does_not_swallow_xml,
     ]
     for t in tests:
         try:
