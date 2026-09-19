@@ -1462,6 +1462,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
     session_id: str
     prompt: str
     parent_message_id: int | None = None
+    session_new = False
 
     # ── Detect tool result ───────────────────────────────────
     last_tool_call_id = None
@@ -1563,6 +1564,7 @@ async def handle_completion(body: dict, req_id: str) -> dict:
             else:
                 session_id = await client.create_session()
                 parent_message_id = None
+                session_new = True
                 _session_store[nkey] = (session_id, parent_message_id, False, None)
                 if pkey:
                     _session_store[pkey] = (session_id, parent_message_id, False, None)
@@ -1581,13 +1583,22 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         else:
             session_id = await client.create_session()
             parent_message_id = None
+            session_new = True
             _session_store[nkey] = (session_id, parent_message_id, False, None)
             if pkey:
                 _session_store[pkey] = (session_id, parent_message_id, False, None)
             rlog(req_id, f"SESSION: NEW {session_id} (no user/tool role) nkey={nkey} pkey={pkey or '(empty)'}")
 
     # ── Build prompt ─────────────────────────────────────────
-    if is_tool_result:
+    if is_tool_result and session_new:
+        # Для tool_result нет маппинга сессии (обрыв/зачистка). Голый
+        # <tool_result> первым сообщением нового чата создал бы мусорную
+        # переписку — шлём полную историю, чтобы контекст тул-вызова
+        # сохранился. Ограничение: на больших сессиях первое сообщение может
+        # не пройти по лимиту размера DeepSeek (см. лимит первого сообщения).
+        prompt = messages_to_prompt(messages, tools)
+        rlog(req_id, f"ACTION: new session (tool_result, no mapping) → full history ({len(prompt)} chars) → messages_to_prompt")
+    elif is_tool_result:
         if _tool_results_acc:
             # Multiple consecutive tool messages
             parts = []
@@ -1846,10 +1857,17 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                 rlog(req_id, f"STREAM ERROR: [{type(e).__name__}] {e}")
                 if not session_cleaned:
                     session_cleaned = True
-                    for k, v in list(_session_store.items()):
-                        if v[0] == session_id:
-                            rlog(req_id, f"Removing broken session {session_id} key={k} from store")
-                            del _session_store[k]
+                    if bool(full_text) or bool(think_text):
+                        for k, v in list(_session_store.items()):
+                            if v[0] == session_id:
+                                rlog(req_id, f"Removing broken session {session_id} key={k} from store")
+                                del _session_store[k]
+                    else:
+                        # Ничего не эмитировано — то же условие, что у ретрай-стража
+                        # клиента: ответ клиенту не начал утекать. Маппинг оставляем,
+                        # иначе ретрай tool_result уйдёт в новый чат с голым
+                        # <tool_result> первым сообщением (мусорная переписка).
+                        rlog(req_id, f"Nothing emitted — keeping session {session_id} mapping for clean retry")
                 on_error(e)
 
         return {"type": "stream", "run": run_stream,
