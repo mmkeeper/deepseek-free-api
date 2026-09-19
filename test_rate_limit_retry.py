@@ -60,7 +60,7 @@ def test_no_retry_for_other_errors():
 
 
 def test_all_retries_exhausted():
-    """All 7 retries fail — full backoff [1,2,4,8,16,32,64] used, error propagates."""
+    """All retries fail — full backoff used, error propagates."""
     sleeps = []
     attempts = []
 

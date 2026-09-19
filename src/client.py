@@ -22,15 +22,16 @@ log = logging.getLogger("ds")
 # "Сервер перегружен. Попробуйте позже или используйте быстрый режим", and
 # generation_timeout — "Сервер занят, пожалуйста, попробуйте позже." /
 # "Server busy, please try again later.") when requests come in too often or
-# the server is busy. Retry with 1, 2, 4, 8, 16, 32, 64 s — 7 attempts total
-# before the error is propagated to the client. Delay values are logged so the
-# real needed spacing can be tuned later.
+# the server is busy. Retry with doubling backoff up to ~17 min per wait —
+# 11 delays, 12 attempts, ~34 minutes total — so a peak-hour rate limit that
+# lasts half an hour is survived. Delay values are logged so the real needed
+# spacing can be tuned later.
 _RETRYABLE_FINISH_REASONS = {
     "rate_limit_reached",
     "expert_busy_use_default",
     "generation_timeout",
 }
-_RATE_LIMIT_BACKOFF = [1, 2, 4, 8, 16, 32, 64]
+_RATE_LIMIT_BACKOFF = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 # Polling backoff (seconds) between fetch_files attempts while a file is being
 # processed on DeepSeek's side (status PENDING → SUCCESS). Doubling delays give
@@ -372,8 +373,9 @@ class DeepSeekClient:
         the server is busy, and finish_reason=generation_timeout
         ("Сервер занят, пожалуйста, попробуйте позже.") when generation was
         discarded because the server was too busy to start it. Retry with
-        backoff 1, 2, 4, 8, 16, 32, 64 s. If the request still fails after all
-        retries the last error is propagated to the caller.
+        doubling backoff 1..1024 s (11 delays, ~34 minutes total). If the
+        request still fails after all retries the last error is propagated to
+        the caller.
         Retries happen only when the failure arrived before any content was
         emitted — replaying an already-partially-streamed response would
         duplicate output for the client.

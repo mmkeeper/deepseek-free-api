@@ -24,13 +24,25 @@ def _strip_dsml(chunk: str, pending: str) -> tuple[str, str]:
     The tail may be the start of a marker that is still arriving, so it is
     kept until the next chunk (or the end of the stream) decides whether it
     completes a marker.
+
+    A COMPLETE marker at the very end of the buffer is also kept on hold: its
+    padding space may arrive with the next chunk (DeepSeek tokenizes
+    "<\\uff5c\\uff5cDSML\\uff5c\\uff5c calls>" as "<", bars+DSML, " calls>").
+    The padding must be consumed together with the marker, otherwise the stray
+    space survives and leaks to the client as "< calls>". The held marker is
+    dropped by the caller at end-of-stream (only a genuinely incomplete tail —
+    literal bars with no DSML — is flushed as text).
     """
-    cleaned = _DSML_MARKER_RE.sub("", pending + chunk)
-    hold = ""
+    buf = pending + chunk
+    hold_len = 0
     for k in range(1, len(_DSML_MARKER)):
-        if cleaned.endswith(_DSML_MARKER[:k]):
-            hold = cleaned[-k:]
-    return cleaned[: len(cleaned) - len(hold)], hold
+        if buf.endswith(_DSML_MARKER[:k]):
+            hold_len = k
+    if buf.endswith(_DSML_MARKER):
+        hold_len = len(_DSML_MARKER)
+    if hold_len:
+        return _DSML_MARKER_RE.sub("", buf[:-hold_len]), buf[-hold_len:]
+    return _DSML_MARKER_RE.sub("", buf), ""
 
 
 class DeepSeekError(Exception):
@@ -258,13 +270,15 @@ async def stream_sse(
                     on_thinking(thinking)
 
     if pending_text:
-        full_text += pending_text
-        if on_text:
-            on_text(pending_text)
+        flushed = _DSML_MARKER_RE.sub("", pending_text)
+        full_text += flushed
+        if flushed and on_text:
+            on_text(flushed)
     if pending_think:
-        full_thinking += pending_think
-        if on_thinking:
-            on_thinking(pending_think)
+        flushed = _DSML_MARKER_RE.sub("", pending_think)
+        full_thinking += flushed
+        if flushed and on_thinking:
+            on_thinking(flushed)
 
     if debug:
         log.debug(f"[REQ-{req_id}] SSE done — {sse_count} events, {len(full_text)} chars text, {len(full_thinking)} chars thinking")

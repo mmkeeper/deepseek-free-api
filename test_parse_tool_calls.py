@@ -668,6 +668,31 @@ def test_spaced_tags_stripped_from_client_text():
     print("  PASS: spaced tags stripped from client text")
 
 
+def test_calls_wrapper_region_no_residue():
+    """Обёртка <calls> ... </calls> целиком входит в регион: в before/tail не
+    остаётся <calls> / </calls> (регресс REQ-1ec8b60034 — остатки в Hermes)."""
+    from server import _TOOL_OPEN_RE, _tool_region_end, _strip_vyzov_blocks
+    text = """Отвечаю.
+
+<calls>
+<invoke name="skill_view">
+<parameter name="name" string="true">web-fetch-diagnostics</parameter>
+</invoke>
+</calls>
+"""
+    tcs = parse_tool_calls(text)
+    assert len(tcs) == 1 and tcs[0]["name"] == "skill_view", tcs
+    m = _TOOL_OPEN_RE.search(text)
+    assert m is not None and text.startswith("<calls>", m.start()), text[m.start():m.start() + 10]
+    region_end = _tool_region_end(text, m.start())
+    assert text[region_end - 8:region_end] == "</calls>", text[region_end - 20:region_end]
+    before = _strip_tool_tags(text[:m.start()])
+    tail = _strip_tool_tags(_strip_vyzov_blocks(text[region_end:])).lstrip("\n")
+    assert before == "Отвечаю.\n\n", repr(before)
+    assert tail == "", repr(tail)
+    print("  PASS: <calls> wrapper fully inside region — no residue")
+
+
 def test_strip_tool_tags_keeps_literal_mention():
     """Литеральное упоминание `<usr_tool_calls>` в прозе — НЕ вызов и НЕ вырезается.
     (Сообщено: «что вызывать надо через <usr_tool_calls>» превращалось в «через .»)."""
@@ -928,6 +953,7 @@ if __name__ == "__main__":
         test_messages_to_prompt_rewrites_tool_descriptions,
         test_spaced_tags_parsed,
         test_spaced_tags_stripped_from_client_text,
+        test_calls_wrapper_region_no_residue,
         test_strip_tool_tags_keeps_literal_mention,
         test_dsml_marker_glued_into_tags_scrubbed,
         test_usr_param_typo_closing_tag_does_not_swallow_xml,

@@ -447,7 +447,10 @@ _TOOL_ELEMENT_RE = re.compile(
 # Открывающий тег любого семейства вызова — для детекции региона в стриме и
 # выделения нарратива до/после вызова. `\b` исключает ложные совпадения вида
 # <usr_tool_callsomething> и не требует `<` сразу перед tool_calls (usr_ префикс).
-_TOOL_OPEN_RE = re.compile(r'<\s*(?:usr_tool_call|usr_tool_calls|tool_call|tool_calls|invoke)\b')
+# Босой `calls` — обёртка, которой flash обрамляет блок invoke-вызовов
+# (<|>>| calls> ... </|>>| calls>); региона должен покрывать её целиком, чтобы
+# обёртка не утекала в текст ответа остатками <calls> / </calls>.
+_TOOL_OPEN_RE = re.compile(r'<\s*(?:usr_tool_call|usr_tool_calls|tool_call|tool_calls|invoke|calls)\b')
 
 # DeepSeek's "||DSML||" service marker is a mix of U+FF5C fullwidth bars and
 # the letters "DSML". stream_sse strips it, but as a safety net purge any
@@ -725,7 +728,7 @@ def _tool_region_end(masked: str, start: int) -> int:
     region внутри блока Вызов закрывается фенсом (обрабатывает вызывающий код).
     """
     last = 0
-    for c in re.finditer(r'</\s*(?:usr_tool_calls?|usr_parameter|tool_calls|tool_call|invoke)\b[^>]*>',
+    for c in re.finditer(r'</\s*(?:usr_tool_calls?|usr_parameter|tool_calls|tool_call|invoke|calls)\b[^>]*>',
                          masked[start:]):
         last = c.end()
     return start + last if last else len(masked)

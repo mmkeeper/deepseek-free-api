@@ -216,7 +216,7 @@ def test_dsml_marker_split_across_events_filtered():
     joined = "".join(out_text)
     assert bar not in joined, f"DSML bar leaked: {joined!r}"
     assert "DSML" not in joined, f"DSML letters leaked: {joined!r}"
-    assert joined == '< invoke name="skill_view"><parameter name="name"></parameter></invoke>', joined
+    assert joined == '<invoke name="skill_view"><parameter name="name"></parameter></invoke>', joined
 
 
 def test_dsml_marker_split_across_event_and_end_flushed():
@@ -237,6 +237,44 @@ def test_dsml_marker_split_across_event_and_end_flushed():
     assert joined == "text " + bar + bar, f"unfinished marker tail must be flushed as text, got: {joined!r}"
 
 
+def test_dsml_marker_split_padding_eaten():
+    """Marker completed in one event, its padding space arriving with the next
+    event is still consumed — no "< calls>" residue.
+
+    DeepSeek tokenizes "<|>>| calls>" as "<", bars+DSML, " calls>", so the
+    space reaches the stripper separately from the marker. It must be eaten
+    together with the marker, not left behind.
+    """
+    import asyncio
+    import json
+    from src.sse import stream_sse
+
+    bar = "\uff5c"
+
+    class FakeResp:
+        async def aiter_text(self):
+            for piece in [
+                "Отвечаю.\n\n",
+                "<", bar, bar, "DS", "ML", bar, bar, " calls>",
+                "\n",
+                "<", bar, bar, "DS", "ML", bar, bar, ' invoke name="skill_view">',
+                "\n",
+                "</", bar, bar, "DS", "ML", bar, bar, " invoke>",
+                "\n",
+                "</", bar, bar, "DS", "ML", bar, bar, " calls>",
+            ]:
+                yield f'data: {json.dumps({"v": piece})}\n\n'
+
+    out_text, _ = [], []
+    asyncio.run(stream_sse(FakeResp(), on_text=out_text.append))
+    joined = "".join(out_text)
+    assert "< calls>" not in joined, f"stray space after rails leaked: {joined!r}"
+    assert "</ calls>" not in joined, f"stray space in closing rails leaked: {joined!r}"
+    assert " calls>" not in joined, joined
+    assert "<calls>" in joined and "</calls>" in joined, f"wrapper tags lost: {joined!r}"
+    assert '<invoke name="skill_view">' in joined and "</invoke>" in joined, joined
+
+
 if __name__ == "__main__":
     tests = [
         test_think_snapshot_delta,
@@ -252,6 +290,7 @@ if __name__ == "__main__":
         test_dsml_marker_padded_with_spaces_filtered,
         test_dsml_marker_split_across_events_filtered,
         test_dsml_marker_split_across_event_and_end_flushed,
+        test_dsml_marker_split_padding_eaten,
     ]
     for t in tests:
         try:
