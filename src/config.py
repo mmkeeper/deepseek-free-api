@@ -13,6 +13,10 @@ AUTH_DIR = Path.home() / ".deepseek-free-api"
 AUTH_FILE = AUTH_DIR / "auth.json"
 BROWSER_PROFILE = str(AUTH_DIR / "browser-profile")
 
+TTS_PATH = "/api/v0/chat/tts"
+TICKET_PATH = "/api/v0/auth/ticket"
+TTS_CACHE_DIR = AUTH_DIR / "tts"
+
 
 def get_socks5_proxy() -> str:
     return os.environ.get("SOCKS5_PROXY", "")

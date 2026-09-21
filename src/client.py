@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import BASE_URL, COMPLETION_PATH, STOP_STREAM_PATH
+from .config import BASE_URL, COMPLETION_PATH, STOP_STREAM_PATH, TICKET_PATH
 from .headers import base_headers
 from .pow import solve_pow
 from .proxy import get_http_client
@@ -52,9 +52,55 @@ class DeepSeekClient:
         self.token = token
         self.debug = debug
         self._model_settings: dict[str, dict] | None = None
+        self.device_id = uuid.uuid4().hex
 
     def _build_headers(self) -> dict:
         return base_headers(self.cookie_header, self.token)
+
+    async def get_tts_ticket(self, req_id: str = "") -> str:
+        """Fetch a short-lived (600 s) TTS ticket for the WebSocket handshake.
+
+        The ticket is minted per-scope ({"scope":"tts"}) with the same Bearer
+        token used for chat sessions, so it must be fetched right before each
+        synthesis and never cached.
+        """
+        client = get_http_client()
+        url = f"{BASE_URL}{TICKET_PATH}"
+        headers = self._build_headers()
+        headers["x-client-bundle-id"] = "com.deepseek.chat"
+        headers["x-device-id"] = self.device_id
+        headers["x-device-model"] = ""
+
+        if req_id:
+            log.debug(f"[REQ-{req_id}] DEEPSEEK POST {TICKET_PATH}")
+        resp = await client.post(url, headers=headers, content='{"scope":"tts"}')
+
+        try:
+            data = json.loads(resp.text)
+        except (json.JSONDecodeError, ValueError):
+            if resp.status_code in (401, 403):
+                raise AuthError("tts ticket")
+            raise RuntimeError(
+                f"TTS ticket: expected JSON, got HTTP {resp.status_code}: "
+                f"{resp.text[:180]}"
+            )
+
+        if resp.status_code in (401, 403) or data.get("code") in (40002, 40003):
+            raise AuthError("tts ticket")
+        if resp.is_error or (data.get("code") is not None and data["code"] != 0):
+            raise RuntimeError(
+                f"DeepSeek API error at {TICKET_PATH}: HTTP {resp.status_code}, "
+                f"code {data.get('code')}, msg {data.get('msg', '')}"
+            )
+
+        ticket = data.get("data", {}).get("biz_data", {}).get("ticket")
+        if not ticket:
+            raise RuntimeError(
+                f"Cannot read TTS ticket: {json.dumps(data)[:300]}"
+            )
+        if req_id:
+            log.debug(f"[REQ-{req_id}] TTS ticket ok (len={len(ticket)})")
+        return ticket
 
     async def fetch_model_settings(self) -> dict[str, dict]:
         """Fetch model settings from DeepSeek and cache them."""

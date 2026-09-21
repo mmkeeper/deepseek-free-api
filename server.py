@@ -81,6 +81,7 @@ from src.auth import (
     print_manual_instructions,
     read_saved_auth,
 )
+from src import tts
 from src.client import AuthError, DeepSeekClient
 from src.sse import DeepSeekError
 from src.config import BASE_URL
@@ -829,6 +830,169 @@ def _record_turn(session_id: str, key: str, parent_id: int | None,
         "response_msg_id": response_msg_id,
         "user_text": user_text,
     })
+
+
+# ─── TTS (voice playback of assistant messages) ─────────────
+# TTS works only for real DeepSeek chat messages. The proxy resolves the
+# message by (chat_session_id, message_index) against the turn frames the
+# completion flow recorded — the client does NOT have to resend its history.
+# message_index is the 0-based ordinal of the assistant message among the
+# session's assistant replies (regenerations keep their slot); negative counts
+# from the newest. System-prompt/anchor messages have no frame → not voiceable.
+# Audio is cached as Ogg Opus on disk; repeat requests are served from the
+# cache. In-flight downloads are deduplicated per cache key.
+_tts_inflight: dict[str, asyncio.Future] = {}
+_tts_lock = asyncio.Lock()
+
+# Bump when the cached audio format changes (e.g. WS counter-stripping), so
+# previously generated corrupt files are not served.
+_TTS_CACHE_VERSION = 3
+
+
+class TtsResolveError(Exception):
+    """Client-facing TTS contract error.
+
+    error_code is a stable machine-readable code; param names the request
+    field that caused the error.
+    """
+
+    def __init__(self, error_code: str, message: str, param: str | None = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.message = message
+        self.param = param
+
+
+def _session_turn_keys(session_id: str) -> list[str]:
+    """Ordered list of distinct turn keys of a DeepSeek session.
+
+    Frames are append-only; regenerations append a new frame with the SAME
+    key. The client's assistant-message numbering maps to the distinct keys in
+    first-appearance order — one slot per turn, regenerations reuse the slot.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+    for f in _session_frames.get(session_id, []):
+        k = f.get("key")
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
+
+
+def _resolve_tts_by_session_index(session_id: str, message_index: int | None) -> tuple[str, int]:
+    """Canonical resolution: chat_session_id + message_index.
+
+    message_index is 0-based among the session's assistant messages; negative
+    counts from the newest. The latest reply of a regenerated turn is used.
+    """
+    if not _session_frames.get(session_id):
+        raise TtsResolveError(
+            "message_not_voiceable",
+            "No assistant messages recorded for this session — only replies "
+            "actually generated through this proxy can be voiced",
+            param="chat_session_id",
+        )
+    keys = _session_turn_keys(session_id)
+    idx = -1 if message_index is None else message_index
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        raise TtsResolveError(
+            "invalid_message_index",
+            "message_index must be an integer — the 0-based assistant message "
+            "number in this session (negative counts from the end)",
+            param="message_index",
+        )
+    if idx < 0:
+        idx += len(keys)
+    if idx < 0 or idx >= len(keys):
+        raise TtsResolveError(
+            "invalid_message_index",
+            f"message_index {message_index} is out of range: session has "
+            f"{len(keys)} assistant message(s)",
+            param="message_index",
+        )
+    frame = _frame_for_key(session_id, keys[idx])
+    mid = frame.get("response_msg_id") if frame else None
+    if mid is None:
+        raise TtsResolveError(
+            "message_not_voiceable",
+            "This assistant message cannot be voiced",
+            param="message_index",
+        )
+    return session_id, mid
+
+
+def _resolve_tts_raw(session_id: str, message_id: int | str) -> tuple[str, int]:
+    """Advanced resolution by the DeepSeek message_id directly."""
+    mid = str(message_id)
+    for f in _session_frames.get(session_id, []):
+        if str(f.get("response_msg_id")) == mid:
+            return session_id, int(mid)
+    raise TtsResolveError(
+        "message_not_voiceable",
+        "message_id does not belong to this session's assistant messages",
+        param="message_id",
+    )
+
+
+def _resolve_tts_by_messages(messages: list[dict], message_index: int | None) -> tuple[str, int]:
+    """Legacy resolution from a full messages array (clients without a
+    session id). message_index is 0-based into messages (negative from the
+    end); omitted → newest assistant message.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise TtsResolveError(
+            "invalid_message_index",
+            "messages must be a non-empty array when resolved by history",
+            param="messages",
+        )
+    n = len(messages)
+
+    if message_index is not None:
+        idx = message_index
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            raise TtsResolveError(
+                "invalid_message_index",
+                "message_index must be an integer",
+                param="message_index",
+            )
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise TtsResolveError(
+                "invalid_message_index",
+                f"message_index {message_index} out of range "
+                f"(messages has {n} entries)",
+                param="message_index",
+            )
+        if messages[idx].get("role") != "assistant":
+            raise TtsResolveError(
+                "not_assistant_message",
+                f"message at index {idx} has role '{messages[idx].get('role')}', "
+                f"expected 'assistant'",
+                param="message_index",
+            )
+        candidates = [idx]
+    else:
+        candidates = range(n - 1, -1, -1)
+
+    for i in candidates:
+        if messages[i].get("role") != "assistant":
+            continue
+        key = _hash_messages(_user_messages(messages[: i + 1]))
+        existing = _session_store.get(key)
+        if not existing:
+            continue
+        frame = _frame_for_key(existing[0], key)
+        if frame is not None and frame.get("response_msg_id") is not None:
+            return existing[0], frame["response_msg_id"]
+
+    raise TtsResolveError(
+        "message_not_voiceable",
+        "No assistant message of this history was produced through the proxy "
+        "— system-prompt or synthetic messages cannot be voiced",
+        param="messages",
+    )
 
 
 def _truncate_content(text: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
@@ -1929,6 +2093,8 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         response_body["choices"][0]["message"]["reasoning_content"] = full_thinking
 
     rlog(req_id, f"→ PROXY → HERMES  response ({len(json.dumps(response_body))} chars)")
+    # Позволяем клиенту ссылаться на этот ответ для TTS без передачи истории.
+    response_body["chat_session_id"] = session_id
     return {"type": "json", "body": json.dumps(response_body)}
 
 
@@ -1983,14 +2149,15 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         return web.Response(text=result["body"], content_type="application/json")
 
     # Streaming response
-    response = web.StreamResponse(
-        status=200,
-        headers={
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
-    )
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
+    session_id = result.get("session_id")
+    if session_id:
+        headers["X-Chat-Session-Id"] = str(session_id)
+    response = web.StreamResponse(status=200, headers=headers)
     await response.prepare(request)
 
     write_queue = asyncio.Queue()
@@ -2065,6 +2232,417 @@ async def handle_not_found(request: web.Request) -> web.Response:
     )
 
 
+# ─── TTS handlers ───────────────────────────────────────────
+
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+async def _serve_cached_file(request: web.Request, path: Path) -> web.StreamResponse:
+    """Stream a cached Ogg Opus file with single-byte-range support."""
+    size = path.stat().st_size
+    start, end = 0, size - 1
+    rng = request.headers.get("Range", "")
+    if rng:
+        m = _RANGE_RE.match(rng)
+        if m:
+            a, b = m.group(1), m.group(2)
+            if a:
+                start = int(a)
+            if b:
+                end = min(int(b), size - 1)
+        if start > end or start >= size:
+            return web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
+    length = end - start + 1
+
+    resp = web.StreamResponse(headers={
+        "Content-Type": "audio/ogg; codecs=opus",
+        "Content-Length": str(length),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=31536000, immutable",
+    })
+    if rng:
+        resp.set_status(206)
+        resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+
+    await resp.prepare(request)
+    with open(path, "rb") as f:
+        f.seek(start)
+        remaining = length
+        while remaining > 0:
+            chunk = f.read(min(65536, remaining))
+            if not chunk:
+                break
+            await resp.write(chunk)
+            remaining -= len(chunk)
+    await resp.write_eof()
+    return resp
+
+
+async def _tts_stream(
+    request: web.Request,
+    req_id: str,
+    session_id: str,
+    message_id: int,
+    voice: str,
+    cache_file: Path,
+    fut: asyncio.Future,
+) -> web.Response:
+    """Stream TTS audio to the client while writing it to the cache file.
+
+    The download task feeds every emitted page into a queue; the writer copies
+    it into the cache temp file and to the HTTP response. On clean finish the
+    temp file is atomically renamed into the cache. Errors before the first
+    page return a JSON error; mid-stream failures just cut the response.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    meta: dict = {}
+    err: Exception | None = None
+
+    def on_page(page: bytes):
+        queue.put_nowait(page)
+
+    async def run():
+        nonlocal err
+        try:
+            client = create_client()
+            meta.update(await tts.download_tts(
+                client, session_id, message_id, voice=voice,
+                on_page=on_page, req_id=req_id,
+                debug=DEBUG or logging.getLogger().isEnabledFor(logging.DEBUG),
+            ))
+        except Exception as e:
+            err = e
+        finally:
+            queue.put_nowait(None)
+
+    task = asyncio.create_task(run())
+    response = web.StreamResponse(headers={"Content-Type": "audio/ogg; codecs=opus"})
+    response.enable_chunked_encoding()
+    prepared = False
+    total = 0
+
+    tmp = cache_file.with_suffix(".part")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(tmp, "wb") as out:
+            while True:
+                page = await queue.get()
+                if page is None:
+                    break
+                if not prepared:
+                    await response.prepare(request)
+                    prepared = True
+                out.write(page)
+                total += len(page)
+                await response.write(page)
+
+        if err is not None:
+            rlog(req_id, f"TTS ERROR after {total} bytes: [{type(err).__name__}] {err}")
+            tmp.unlink(missing_ok=True)
+            if not prepared:
+                fut.set_exception(err)
+                return web.json_response(
+                    {"error": "tts_failed", "message": str(err)}, status=502
+                )
+            fut.set_exception(err)
+            await response.write_eof()
+            return response
+
+        if total:
+            os.replace(tmp, cache_file)
+        else:
+            tmp.unlink(missing_ok=True)
+        await response.write_eof()
+        fut.set_result(True)
+        rlog(req_id, f"TTS done: mode={meta.get('mode')} frames={meta.get('packets')} "
+                     f"bytes={total} cached={cache_file.name}")
+        return response
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        rlog(req_id, f"TTS CLIENT DISCONNECT: {e}")
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+        tmp.unlink(missing_ok=True)
+        fut.set_exception(e)
+        if prepared:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+        return response
+
+
+async def handle_tts(request: web.Request) -> web.Response:
+    """POST /v1/audio/tts — voice an existing assistant message.
+
+    Канонический контракт (сессия уже известна прокси, history не нужна):
+        {"chat_session_id": "<id>", "message_index": 0|-1, "voice": "mira"}
+    message_index — 0-based номер ассистентского ответа в сессии (только
+    assistant-сообщения; регенерации индекс не меняют); минус — с конца.
+
+    Альтернативы:
+        {"chat_session_id": "...", "message_id": <DeepSeek id>}   (advanced)
+        {"messages": [...], "message_index": 0|...}               (legacy)
+    Ответ — поток Ogg Opus, повторные запросы отдаются из кэша.
+    """
+    req_id = _req_id()
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response(
+            {"error": "invalid_json", "message": "Request body must be JSON",
+             "param": None},
+            status=400,
+        )
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "invalid_json", "message": "Request body must be a JSON object",
+             "param": None},
+            status=400,
+        )
+
+    voice = body.get("voice", "mira")
+    if not isinstance(voice, str) or not voice:
+        voice = "mira"
+
+    raw_session = body.get("chat_session_id")
+    raw_msg = body.get("message_id")
+    message_index = body.get("message_index")
+    if message_index is None and "index" in body:
+        message_index = body["index"]
+    messages = body.get("messages")
+
+    try:
+        if raw_session and message_index is not None:
+            target = _resolve_tts_by_session_index(raw_session, message_index)
+        elif raw_session and raw_msg is not None:
+            target = _resolve_tts_raw(raw_session, raw_msg)
+        elif raw_session:
+            rlog(req_id, "TTS: no message_index — using newest assistant reply")
+            target = _resolve_tts_by_session_index(raw_session, None)
+        elif messages:
+            target = _resolve_tts_by_messages(messages, message_index)
+        else:
+            raise TtsResolveError(
+                "invalid_message_index",
+                "Missing message reference: send chat_session_id + message_index "
+                "(or chat_session_id + message_id)",
+                param="message_index",
+            )
+    except TtsResolveError as e:
+        rlog(req_id, f"TTS resolve error: {e.error_code}: {e.message}")
+        return web.json_response(
+            {"error": e.error_code, "message": e.message, "param": e.param},
+            status=400,
+        )
+    session_id, message_id = target
+
+    key = hashlib.sha256(
+        f"{session_id}:{message_id}:{voice}:v{_TTS_CACHE_VERSION}".encode()
+    ).hexdigest()
+    cache_file = tts.tts_cache_dir() / f"{key}.ogg"
+
+    if cache_file.exists():
+        rlog(req_id, f"TTS CACHE HIT {session_id} msg={message_id} voice={voice} "
+                     f"({cache_file.stat().st_size} bytes)")
+        return await _serve_cached_file(request, cache_file)
+
+    async with _tts_lock:
+        fut = _tts_inflight.get(key)
+        if fut is not None and fut.done():
+            _tts_inflight.pop(key, None)
+            fut = None
+        if fut is None:
+            fut = asyncio.get_running_loop().create_future()
+            _tts_inflight[key] = fut
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        rlog(req_id, f"TTS DEDUP — waiting for in-flight {key[:8]}")
+        try:
+            await asyncio.shield(fut)
+        except Exception:
+            pass
+        if cache_file.exists():
+            rlog(req_id, f"TTS CACHE HIT after wait {key[:8]}")
+            return await _serve_cached_file(request, cache_file)
+        return web.json_response(
+            {"error": "tts_failed",
+             "message": "TTS generation failed on the upstream"}, status=502
+        )
+
+    try:
+        return await _tts_stream(
+            request, req_id, session_id, message_id, voice, cache_file, fut
+        )
+    finally:
+        async with _tts_lock:
+            _tts_inflight.pop(key, None)
+
+
+# ─── OpenAPI schema ────────────────────────────────────────
+
+OPENAPI_SPEC: dict = {
+    "openapi": "3.0.3",
+    "info": {
+        "title": "DeepSeek Free -> OpenAI-compatible Proxy",
+        "version": "2.0.0",
+        "description": (
+            "Прокси над бесплатной веб-сессией DeepSeek. OpenAI-совместимые "
+            "completions плюс нестандартный TTS-эндпоинт для озвучивания "
+            "собственных ответов ассистента (DeepSeek умеет синтезировать "
+            "только реальные сообщения чата, поэтому произвольный текст "
+            "нельзя озвучить)."
+        ),
+    },
+    "paths": {
+        "/v1/chat/completions": {
+            "post": {
+                "summary": "Chat completions (OpenAI-совместимый).",
+                "responses": {
+                    "200": {"description": "SSE stream или JSON-ответ"},
+                    "401": {"description": "Требуется авторизация DeepSeek"},
+                    "429": {"description": "Запрос уже выполняется"},
+                    "500": {"description": "Внутренняя ошибка"},
+                },
+            }
+        },
+        "/v1/audio/tts": {
+            "post": {
+                "summary": "Озвучить существующее ассистентское сообщение.",
+                "description": (
+                    "Канонический контракт: chat_session_id + message_index. "
+                    "Прокси сам отслеживает сообщения по сессии, history "
+                    "передавать не нужно. chat_session_id берётся из "
+                    "completion-ответа (поле chat_session_id в JSON-ответе "
+                    "или заголовок X-Chat-Session-Id у SSE)."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/TtsRequest"}
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "Оgg Opus-аудио поток (audio/ogg)",
+                        "content": {
+                            "audio/ogg; codecs=opus": {
+                                "schema": {"type": "string", "format": "binary"}
+                            }
+                        },
+                    },
+                    "400": {"$ref": "#/components/responses/TtsError"},
+                    "405": {"description": "Только POST"},
+                    "502": {"description": "Ошибка синтеза на стороне DeepSeek"},
+                },
+            }
+        },
+        "/v1/models": {
+            "get": {"summary": "Список доступных моделей."},
+        },
+        "/health": {
+            "get": {"summary": "Статус сервера."},
+        },
+        "/openapi.json": {
+            "get": {"summary": "Эта схема."},
+        },
+    },
+    "components": {
+        "schemas": {
+            "TtsRequest": {
+                "type": "object",
+                "description": (
+                    "Способы указать сообщение:\n"
+                    "1) chat_session_id + message_index — канонический;\n"
+                    "2) chat_session_id + message_id (виден в отладке) — advanced;\n"
+                    "3) messages (+ message_index) — legacy, для клиентов без session id.\n"
+                    "message_index: 0-based номер ассистентского ответа в сессии "
+                    "(только assistant-сообщения; регенерации индекс не меняют); "
+                    "отрицательные значения считаются с конца. Озвучивать можно "
+                    "только ответы, сгенерированные DeepSeek через этот прокси."
+                ),
+                "oneOf": [
+                    {"required": ["chat_session_id", "message_index"]},
+                    {"required": ["chat_session_id", "message_id"]},
+                    {"required": ["messages"]},
+                ],
+                "properties": {
+                    "chat_session_id": {
+                        "type": "string",
+                        "description": "DeepSeek session id из completion-ответа.",
+                    },
+                    "message_index": {
+                        "type": "integer",
+                        "default": -1,
+                        "description": "0-based номер ассистентского ответа; -1 = самый свежий.",
+                    },
+                    "message_id": {
+                        "type": "integer",
+                        "description": "(advanced) Идентификатор ответа внутри DeepSeek.",
+                    },
+                    "messages": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/ChatMessage"},
+                        "description": "(legacy) Полная история диалога как в /v1/chat/completions.",
+                    },
+                    "voice": {"type": "string", "default": "mira", "enum": ["mira"]},
+                },
+            },
+            "ChatMessage": {
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "enum": ["system", "user", "assistant", "tool"],
+                    },
+                    "content": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "object"}},
+                        ]
+                    },
+                },
+            },
+            "Error": {
+                "type": "object",
+                "properties": {
+                    "error": {"type": "string", "description": "Машинный код ошибки"},
+                    "message": {"type": "string"},
+                    "param": {"type": "string", "nullable": True},
+                },
+            },
+        },
+        "responses": {
+            "TtsError": {
+                "description": (
+                    "Контрактная ошибка. error ∈ "
+                    "{invalid_message_index, not_assistant_message, "
+                    "message_not_voiceable}"
+                ),
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/Error"}
+                    }
+                },
+            },
+        },
+    },
+}
+
+
+async def handle_openapi(request: web.Request) -> web.Response:
+    return web.json_response(OPENAPI_SPEC)
+
+
 # ─── CORS middleware ───────────────────────────────────────
 
 @web.middleware
@@ -2079,6 +2657,7 @@ async def cors_middleware(request, handler):
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Expose-Headers"] = "X-Chat-Session-Id"
     return resp
 
 
@@ -2088,10 +2667,12 @@ async def run_server(port: int, host: str):
     app = web.Application(middlewares=[cors_middleware], client_max_size=0)
     app["port"] = port
 
-    app.router.add_route("*", "/v1/models", handle_models)
-    app.router.add_route("*", "/health", handle_health)
-    app.router.add_route("*", "/", handle_health)
-    app.router.add_route("*", "/v1/chat/completions", handle_chat)
+    app.router.add_route("GET", "/v1/models", handle_models)
+    app.router.add_route("GET", "/health", handle_health)
+    app.router.add_route("GET", "/", handle_health)
+    app.router.add_route("GET", "/openapi.json", handle_openapi)
+    app.router.add_route("POST", "/v1/chat/completions", handle_chat)
+    app.router.add_route("POST", "/v1/audio/tts", handle_tts)
     app.router.add_route("*", "/{path:.*}", handle_not_found)
 
     runner = web.AppRunner(app)
@@ -2117,7 +2698,9 @@ async def run_server(port: int, host: str):
 ║  {proxy_line:<48}║
 ║══════════════════════════════════════════════════║
 ║  POST http://localhost:{port}/v1/chat/completions ║
+║  POST http://localhost:{port}/v1/audio/tts        ║
 ║  GET  http://localhost:{port}/v1/models           ║
+║  GET  http://localhost:{port}/openapi.json        ║
 ║  GET  http://localhost:{port}/health              ║
 ╚══════════════════════════════════════════════════╝
         """)
@@ -2132,7 +2715,9 @@ async def run_server(port: int, host: str):
 |  {safe_line:<48}|
 +--------------------------------------------------+
 |  POST http://localhost:{port}/v1/chat/completions |
+|  POST http://localhost:{port}/v1/audio/tts        |
 |  GET  http://localhost:{port}/v1/models           |
+|  GET  http://localhost:{port}/openapi.json        |
 |  GET  http://localhost:{port}/health              |
 +--------------------------------------------------+
         """)
