@@ -1,6 +1,8 @@
 """Test rate_limit_reached retry logic in DeepSeekClient.complete()."""
 import asyncio
 import sys
+import threading
+import time
 from unittest import mock
 
 sys.path.insert(0, ".")
@@ -171,6 +173,66 @@ def test_retryable_finish_reasons_set():
     assert "rate_limit_reached" in _RETRYABLE_FINISH_REASONS
     assert "expert_busy_use_default" in _RETRYABLE_FINISH_REASONS
     assert "generation_timeout" in _RETRYABLE_FINISH_REASONS
+    assert "parallel_chat_limit" in _RETRYABLE_FINISH_REASONS
+
+
+def test_retries_on_parallel_chat_limit():
+    """parallel_chat_limit (concurrent generation) is retried like rate limit."""
+    sleeps = []
+    attempts = []
+
+    async def fake_once(**kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise DeepSeekError("слишком много параллельных запросов", "parallel_chat_limit")
+        return {"lastAssistantMessageId": 11, "text": "ok", "thinking": ""}
+
+    c = _client(_complete_once=fake_once)
+    with mock.patch("asyncio.sleep", side_effect=lambda s: sleeps.append(s)):
+        result = _run(c.complete("sid", "prompt", req_id="t8"))
+
+    assert result == {"lastAssistantMessageId": 11, "text": "ok", "thinking": ""}
+    assert sleeps == [1], f"expected backoff 1s got {sleeps}"
+    assert len(attempts) == 2
+
+
+def test_completions_serialized_no_overlap():
+    """Concurrent complete() calls to the same client never overlap.
+
+    DeepSeek rejects parallel generations on one account — the semaphore must
+    queue the second request until the first finishes, even when both start
+    at the same moment (the bridge test fires 4 webhooks at once).
+    """
+    entries = []
+    lock = threading.Lock()
+
+    async def fake_once(req_id="", **kwargs):
+        now = time.monotonic()
+        with lock:
+            active = [e for e in entries if e["end"] is None]
+            assert len(active) == 0, f"overlap detected for {req_id}: {active}"
+            entries.append({"req_id": req_id, "start": now, "end": None})
+        await asyncio.sleep(0.05)
+        with lock:
+            for e in entries:
+                if e["req_id"] == req_id:
+                    e["end"] = time.monotonic()
+        return {"lastAssistantMessageId": 12, "text": "ok", "thinking": ""}
+
+    c = _client(_complete_once=fake_once)
+
+    async def run(n=1):
+        tasks = [asyncio.create_task(c.complete(f"s{i}", f"p{i}", req_id=f"race{i}"))
+                 for i in range(n)]
+        return await asyncio.gather(*tasks)
+
+    results = _run(run(4))
+    assert all(r["text"] == "ok" for r in results)
+    assert len(entries) == 4
+
+    # Entries must be strictly sequential — each next start after prev end.
+    for prev, cur in zip(entries, entries[1:]):
+        assert cur["start"] >= prev["end"] - 1e-9, f"overlap {prev['req_id']} -> {cur['req_id']}"
 
 
 if __name__ == "__main__":
@@ -183,6 +245,8 @@ if __name__ == "__main__":
         test_retries_on_expert_busy_use_default,
         test_retries_on_generation_timeout,
         test_retryable_finish_reasons_set,
+        test_retries_on_parallel_chat_limit,
+        test_completions_serialized_no_overlap,
     ]
     for t in tests:
         try:

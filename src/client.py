@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,8 +31,31 @@ _RETRYABLE_FINISH_REASONS = {
     "rate_limit_reached",
     "expert_busy_use_default",
     "generation_timeout",
+    # DeepSeek rejects concurrent generations on the same session/account with
+    # "parallel_chat_limit". The bridge test (yandex-yaga) fires multiple
+    # webhook requests concurrently — without serialization this reaches the
+    # provider as parallel chit-chats. Treating it as retryable makes a
+    # partially-queued request wait its turn instead of failing.
+    "parallel_chat_limit",
 }
 _RATE_LIMIT_BACKOFF = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+# Upstream DeepSeek does not tolerate concurrent chat completions on one
+# account: firing several requests in parallel yields "parallel_chat_limit"
+# hints and 500s. Serialize every completion through a per-process semaphore
+# (concurrency 1) so requests queue client-side instead of hammering the
+# provider. One lock per event loop: a module-level asyncio.Lock would be
+# bound to the first loop that touches it and blow up in multi-loop tests.
+_completion_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _completion_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _completion_semaphores.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+        _completion_semaphores[loop] = sem
+    return sem
 
 # Polling backoff (seconds) between fetch_files attempts while a file is being
 # processed on DeepSeek's side (status PENDING → SUCCESS). Doubling delays give
@@ -492,15 +516,19 @@ class DeepSeekClient:
     ) -> dict:
         """Call _complete_once, retrying on retryable errors.
 
-        DeepSeek returns an SSE hint with finish_reason=rate_limit_reached
-        ("Слишком частые сообщения") when we hit the per-user rate limit,
-        finish_reason=expert_busy_use_default ("Сервер перегружен...") when
-        the server is busy, and finish_reason=generation_timeout
-        ("Сервер занят, пожалуйста, попробуйте позже.") when generation was
-        discarded because the server was too busy to start it. Retry with
-        doubling backoff 1..1024 s (11 delays, ~34 minutes total). If the
-        request still fails after all retries the last error is propagated to
-        the caller.
+        Completions are serialized through a per-process semaphore: DeepSeek
+        rejects concurrent chats on one account ("parallel_chat_limit",
+        500s), so concurrent requests queue here instead of hammering the
+        provider. The retry loop then handles the transient hints:
+
+        finish_reason=rate_limit_reached ("Слишком частые сообщения") when we
+        hit the per-user rate limit, expert_busy_use_default ("Сервер
+        перегружен...") when the server is busy, generation_timeout ("Сервер
+        занят, пожалуйста, попробуйте позже.") when generation was discarded
+        because the server was too busy to start it, and parallel_chat_limit
+        when two generations raced anyway. Retry with doubling backoff
+        1..1024 s (11 delays, ~34 minutes total). If the request still fails
+        after all retries the last error is propagated to the caller.
         Retries happen only when the failure arrived before any content was
         emitted — replaying an already-partially-streamed response would
         duplicate output for the client.
@@ -525,42 +553,43 @@ class DeepSeekClient:
                 fn(t)
             return wrapped
 
-        for attempt in range(len(_RATE_LIMIT_BACKOFF) + 1):
-            try:
-                return await self._complete_once(
-                    session_id=session_id,
-                    prompt=prompt,
-                    model_type=model_type,
-                    parent_message_id=parent_message_id,
-                    thinking_enabled=thinking_enabled,
-                    search_enabled=search_enabled,
-                    ref_file_ids=ref_file_ids,
-                    req_id=req_id,
-                    on_text=_wrap_text(on_text),
-                    on_thinking=_wrap_thinking(on_thinking),
-                    on_message_id=on_message_id,
-                )
-            except DeepSeekError as e:
-                if e.finish_reason not in _RETRYABLE_FINISH_REASONS:
-                    raise
-                if any(emitted.values()):
-                    log.warning(
-                        f"[REQ-{req_id}] {e.finish_reason} after partial output "
-                        f"(text={emitted['text']} thinking={emitted['thinking']}) "
-                        f"— not retrying, propagating: {e.message}"
+        async with _completion_semaphore():
+            for attempt in range(len(_RATE_LIMIT_BACKOFF) + 1):
+                try:
+                    return await self._complete_once(
+                        session_id=session_id,
+                        prompt=prompt,
+                        model_type=model_type,
+                        parent_message_id=parent_message_id,
+                        thinking_enabled=thinking_enabled,
+                        search_enabled=search_enabled,
+                        ref_file_ids=ref_file_ids,
+                        req_id=req_id,
+                        on_text=_wrap_text(on_text),
+                        on_thinking=_wrap_thinking(on_thinking),
+                        on_message_id=on_message_id,
                     )
-                    raise
-                if attempt >= len(_RATE_LIMIT_BACKOFF):
+                except DeepSeekError as e:
+                    if e.finish_reason not in _RETRYABLE_FINISH_REASONS:
+                        raise
+                    if any(emitted.values()):
+                        log.warning(
+                            f"[REQ-{req_id}] {e.finish_reason} after partial output "
+                            f"(text={emitted['text']} thinking={emitted['thinking']}) "
+                            f"— not retrying, propagating: {e.message}"
+                        )
+                        raise
+                    if attempt >= len(_RATE_LIMIT_BACKOFF):
+                        log.warning(
+                            f"[REQ-{req_id}] {e.finish_reason} — all {len(_RATE_LIMIT_BACKOFF)} "
+                            f"retries exhausted (delays={_RATE_LIMIT_BACKOFF}s), propagating error: {e.message}"
+                        )
+                        raise
+                    delay = _RATE_LIMIT_BACKOFF[attempt]
                     log.warning(
-                        f"[REQ-{req_id}] {e.finish_reason} — all {len(_RATE_LIMIT_BACKOFF)} "
-                        f"retries exhausted (delays={_RATE_LIMIT_BACKOFF}s), propagating error: {e.message}"
+                        f"[REQ-{req_id}] {e.finish_reason} (attempt {attempt + 1}/"
+                        f"{len(_RATE_LIMIT_BACKOFF) + 1}) — retry in {delay}s: {e.message}"
                     )
-                    raise
-                delay = _RATE_LIMIT_BACKOFF[attempt]
-                log.warning(
-                    f"[REQ-{req_id}] {e.finish_reason} (attempt {attempt + 1}/"
-                    f"{len(_RATE_LIMIT_BACKOFF) + 1}) — retry in {delay}s: {e.message}"
-                )
-                await asyncio.sleep(delay)
+                    await asyncio.sleep(delay)
         # Unreachable; keep linters happy.
         raise DeepSeekError("rate_limit_reached after all retries", "rate_limit_reached")
