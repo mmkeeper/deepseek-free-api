@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import BASE_URL, COMPLETION_PATH, STOP_STREAM_PATH, TICKET_PATH
+from .config import BASE_URL, COMPLETION_PATH, STOP_STREAM_PATH, TICKET_PATH, VOICE_PATH, VOICES_PATH
 from .headers import base_headers
 from .pow import solve_pow
 from .proxy import get_http_client
@@ -101,6 +101,85 @@ class DeepSeekClient:
         if req_id:
             log.debug(f"[REQ-{req_id}] TTS ticket ok (len={len(ticket)})")
         return ticket
+
+    async def get_tts_voices(self) -> dict:
+        """Fetch the TTS voice catalogue once per session.
+
+        Returns {"voices": [...], "default_voice_id": str|None,
+        "current_voice_id": str|None} — the same Bearer token as chat is
+        used, so the caller caches it keyed by the token.
+        """
+        client = get_http_client()
+        url = f"{BASE_URL}{VOICES_PATH}"
+        headers = self._build_headers()
+        headers["x-client-bundle-id"] = "com.deepseek.chat"
+        headers["x-device-id"] = self.device_id
+        headers["x-device-model"] = ""
+
+        resp = await client.get(url, headers=headers)
+        try:
+            data = json.loads(resp.text)
+        except (json.JSONDecodeError, ValueError):
+            if resp.status_code in (401, 403):
+                raise AuthError("tts voices")
+            raise RuntimeError(
+                f"TTS voices: expected JSON, got HTTP {resp.status_code}: "
+                f"{resp.text[:180]}"
+            )
+
+        if resp.status_code in (401, 403) or data.get("code") in (40002, 40003):
+            raise AuthError("tts voices")
+        if resp.is_error or (data.get("code") is not None and data["code"] != 0):
+            raise RuntimeError(
+                f"DeepSeek API error at {VOICES_PATH}: HTTP {resp.status_code}, "
+                f"code {data.get('code')}, msg {data.get('msg', '')}"
+            )
+
+        biz = data.get("data", {}).get("biz_data", {})
+        return {
+            "voices": biz.get("voices", []),
+            "default_voice_id": biz.get("default_voice_id"),
+            "current_voice_id": biz.get("current_voice_id"),
+        }
+
+    async def set_tts_voice(self, voice_id: str, req_id: str = "") -> None:
+        """Set the account's current TTS voice.
+
+        DeepSeek's TTS WebSocket carries no voice — the server synthesizes
+        with the account's current voice, changed via this endpoint. The
+        caller is expected to remember the last voice it set and only call
+        this on change.
+        """
+        client = get_http_client()
+        url = f"{BASE_URL}{VOICE_PATH}"
+        headers = self._build_headers()
+        headers["x-client-bundle-id"] = "com.deepseek.chat"
+        headers["x-device-id"] = self.device_id
+        headers["x-device-model"] = ""
+
+        if req_id:
+            log.debug(f"[REQ-{req_id}] DEEPSEEK POST {VOICE_PATH} body={{\"voice_id\": \"{voice_id}\"}}")
+        resp = await client.post(url, headers=headers, json={"voice_id": voice_id})
+        try:
+            data = json.loads(resp.text)
+        except (json.JSONDecodeError, ValueError):
+            if resp.status_code in (401, 403):
+                raise AuthError("tts voice")
+            raise RuntimeError(
+                f"TTS voice: expected JSON, got HTTP {resp.status_code}: "
+                f"{resp.text[:180]}"
+            )
+
+        if resp.status_code in (401, 403) or data.get("code") in (40002, 40003):
+            raise AuthError("tts voice")
+        if resp.is_error or (data.get("code") is not None and data["code"] != 0):
+            raise RuntimeError(
+                f"DeepSeek API error at {VOICE_PATH}: HTTP {resp.status_code}, "
+                f"code {data.get('code')}, msg {data.get('msg', '')}"
+            )
+        if req_id:
+            log.debug(f"[REQ-{req_id}] TTS voice set: code={data.get('code')} "
+                      f"voice_id={voice_id!r}")
 
     async def fetch_model_settings(self) -> dict[str, dict]:
         """Fetch model settings from DeepSeek and cache them."""

@@ -9,6 +9,7 @@ from src.tts import (
     opus_packet_samples,
     opus_toc_config_ms,
     strip_ws_counter,
+    tts_ws_url,
 )
 
 
@@ -175,6 +176,22 @@ def test_muxer_single_packet_marks_last_page_eos():
     assert struct.unpack("<q", last[6:14])[0] == 960
     nseg = last[26]
     assert nseg > 0
+
+
+def test_tts_ws_url_no_voice_param():
+    from urllib.parse import parse_qs, urlparse
+
+    url = tts_ws_url("sess-42", 7, "tok123")
+    parts = urlparse(url)
+    assert parts.scheme == "wss"
+    assert parts.path.endswith("/api/v0/chat/tts")
+    qs = parse_qs(parts.query)
+    assert qs["chat_session_id"] == ["sess-42"]
+    assert qs["message_id"] == ["7"]
+    assert qs["ticket"] == ["tok123"]
+    assert qs["mode"] == ["manual"]
+    assert qs["format"] == ["opus"]
+    assert "voice" not in qs and "voice_id" not in qs
 
 
 def _split_pages(data: bytes) -> list[bytes]:

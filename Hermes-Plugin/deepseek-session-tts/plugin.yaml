@@ -1,0 +1,8 @@
+name: deepseek-session-tts
+version: 1.0.0
+description: "TTS через локальный DeepSeek-прокси: озвучка сообщения сессии по номеру."
+author: keeper
+provides_middleware:
+  - llm_request
+provides_hooks:
+  - post_llm_call

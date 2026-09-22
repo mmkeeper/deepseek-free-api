@@ -14,6 +14,8 @@ AUTH_FILE = AUTH_DIR / "auth.json"
 BROWSER_PROFILE = str(AUTH_DIR / "browser-profile")
 
 TTS_PATH = "/api/v0/chat/tts"
+VOICES_PATH = "/api/v0/chat/tts/voices"
+VOICE_PATH = "/api/v0/chat/tts/voice"
 TICKET_PATH = "/api/v0/auth/ticket"
 TTS_CACHE_DIR = AUTH_DIR / "tts"
 

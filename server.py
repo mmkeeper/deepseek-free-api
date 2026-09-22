@@ -87,6 +87,8 @@ from src.sse import DeepSeekError
 from src.config import BASE_URL
 from src.proxy import get_http_client, get_proxy_info
 
+APP_VERSION = "2.0.0"
+
 
 # ─── Config ───────────────────────────────────────────────
 
@@ -814,6 +816,15 @@ def _prefix_key(messages: list[dict]) -> str:
 # so continuing after a regenerated reply points to the newest response.
 _session_frames: dict[str, list[dict]] = {}
 
+# Message-keys (nkey/pkey) with a completion currently in flight, mapped to
+# (session_id, response_message_id|None). While a key is present here, a
+# messages-based TTS request naming this conversation MUST NOT silently fall
+# back to the previous committed reply — the answer to the latest prompt is
+# still being generated. None = the reply has not been assigned a DeepSeek
+# message id yet (retryable "message_pending" error); otherwise the assigned id
+# of the in-flight reply is used directly.
+_tts_pending: dict[str, tuple[str, int | None]] = {}
+
 
 def _frame_for_key(session_id: str, key: str) -> dict | None:
     for f in reversed(_session_frames.get(session_id, [])):
@@ -843,10 +854,110 @@ def _record_turn(session_id: str, key: str, parent_id: int | None,
 # cache. In-flight downloads are deduplicated per cache key.
 _tts_inflight: dict[str, asyncio.Future] = {}
 _tts_lock = asyncio.Lock()
+# The account has ONE current voice (POST /chat/tts/voice), so upstream
+# syntheses must never overlap: a concurrent request would switch the voice
+# while another is still streaming and corrupt it. The lock wraps
+# voice-set + download, keeping the whole sequence atomic and ordered.
+_tts_download_lock = asyncio.Lock()
 
-# Bump when the cached audio format changes (e.g. WS counter-stripping), so
-# previously generated corrupt files are not served.
-_TTS_CACHE_VERSION = 3
+# Bump when the cached audio format changes (e.g. WS counter-stripping) or the
+# synthesis parameters feeding the cache key change, so previously generated
+# files are not served. v4: voice_id is now sent to DeepSeek — old files
+# generated with the default voice must not be served for other voices.
+_TTS_CACHE_VERSION = 4
+
+# Voice catalogue, loaded once per session (keyed by auth token). Validation
+# fails open: if it cannot be fetched, unknown voices are forwarded and
+# DeepSeek itself decides.
+_TTS_VOICES: dict | None = None
+_tts_voices_lock = asyncio.Lock()
+
+
+async def get_tts_voices() -> dict:
+    """Cached voice catalogue; re-fetched only when the auth token changes."""
+    global _TTS_VOICES, _TTS_CURRENT_VOICE
+    token = auth["token"]
+    cur = _TTS_VOICES
+    if cur is not None and cur.get("token") == token:
+        return cur
+    async with _tts_voices_lock:
+        cur = _TTS_VOICES
+        if cur is not None and cur.get("token") == token:
+            return cur
+        client = create_client()
+        data = await client.get_tts_voices()
+        _TTS_VOICES = {"token": token, **data}
+        # New auth session/account: its voice is unknown until we set one.
+        _TTS_CURRENT_VOICE = None
+        return _TTS_VOICES
+
+
+def _voice_entries(voices: list[dict]) -> list[dict]:
+    """Slim portrait of an upstream voice for the public endpoint."""
+    out = []
+    for v in voices:
+        out.append(
+            {
+                "voice_id": v.get("voice_id"),
+                "name": (v.get("name_i18n") or {}).get("en") or v.get("voice_id"),
+                "gender": v.get("gender"),
+                "languages": v.get("languages", []),
+                "is_default": bool(v.get("is_default")),
+                "description": (v.get("description_i18n") or {}).get("en") or "",
+            }
+        )
+    return out
+
+
+def _validate_voice(voice: str, voices: list[dict]) -> None:
+    allowed = [v.get("voice_id") for v in voices]
+    if voice not in allowed:
+        raise TtsResolveError(
+            "invalid_voice",
+            f"Unknown voice '{voice}'; allowed voices: {sorted(allowed)}",
+            param="voice",
+        )
+
+
+# The DeepSeek TTS handshake carries no voice (see tts_ws_url) — the server
+# synthesizes with the account's current voice, changed via POST
+# /api/v0/chat/tts/voice. The account starts as "unknown"; before the first
+# synthesis we explicitly set the requested voice and remember it in-process,
+# so subsequent requests with the same voice skip the upstream call.
+_TTS_CURRENT_VOICE: str | None = None
+_tts_voice_lock = asyncio.Lock()
+
+
+def _remember_tts_voice(voice: str) -> None:
+    """Store the voice the account is actually set to synthesize with."""
+    global _TTS_CURRENT_VOICE
+    _TTS_CURRENT_VOICE = voice
+    catalog = _TTS_VOICES
+    if catalog is not None and catalog.get("token") == auth["token"]:
+        catalog["current_voice_id"] = voice
+
+
+async def _ensure_tts_voice(voice: str, req_id: str = "") -> None:
+    """Make the account synthesize with `voice`, setting it only on change.
+
+    Downloads are serialized under `_tts_download_lock`; this is called right
+    before each synthesis (still holding that lock). The account starts as
+    "unknown" (None), so the very first request always establishes its voice;
+    subsequent requests with the same voice skip the upstream call.
+    """
+    global _TTS_CURRENT_VOICE
+    if _TTS_CURRENT_VOICE == voice:
+        return
+    async with _tts_voice_lock:
+        if _TTS_CURRENT_VOICE == voice:
+            return
+        try:
+            rlog(req_id, f"TTS voice: setting account voice {voice}")
+            await create_client().set_tts_voice(voice, req_id=req_id)
+        except Exception as e:
+            log.warning("cannot set TTS voice '%s': [%s] %s -- continuing with account voice", voice, type(e).__name__, e)
+            return
+        _remember_tts_voice(voice)
 
 
 class TtsResolveError(Exception):
@@ -880,20 +991,26 @@ def _session_turn_keys(session_id: str) -> list[str]:
     return keys
 
 
+def _validate_session_id(session_id) -> str:
+    if not isinstance(session_id, str) or not session_id:
+        raise TtsResolveError(
+            "invalid_chat_session_id",
+            "chat_session_id must be a non-empty string (from the completion "
+            "response's chat_session_id field or X-Chat-Session-Id header)",
+            param="chat_session_id",
+        )
+    return session_id
+
+
 def _resolve_tts_by_session_index(session_id: str, message_index: int | None) -> tuple[str, int]:
     """Canonical resolution: chat_session_id + message_index.
 
     message_index is 0-based among the session's assistant messages; negative
     counts from the newest. The latest reply of a regenerated turn is used.
+    Type errors are reported before session existence, so a bad index is never
+    masked by an unknown session id.
     """
-    if not _session_frames.get(session_id):
-        raise TtsResolveError(
-            "message_not_voiceable",
-            "No assistant messages recorded for this session — only replies "
-            "actually generated through this proxy can be voiced",
-            param="chat_session_id",
-        )
-    keys = _session_turn_keys(session_id)
+    _validate_session_id(session_id)
     idx = -1 if message_index is None else message_index
     if not isinstance(idx, int) or isinstance(idx, bool):
         raise TtsResolveError(
@@ -902,6 +1019,14 @@ def _resolve_tts_by_session_index(session_id: str, message_index: int | None) ->
             "number in this session (negative counts from the end)",
             param="message_index",
         )
+    if not _session_frames.get(session_id):
+        raise TtsResolveError(
+            "message_not_voiceable",
+            "No assistant messages recorded for this session — only replies "
+            "actually generated through this proxy can be voiced",
+            param="chat_session_id",
+        )
+    keys = _session_turn_keys(session_id)
     if idx < 0:
         idx += len(keys)
     if idx < 0 or idx >= len(keys):
@@ -924,10 +1049,28 @@ def _resolve_tts_by_session_index(session_id: str, message_index: int | None) ->
 
 def _resolve_tts_raw(session_id: str, message_id: int | str) -> tuple[str, int]:
     """Advanced resolution by the DeepSeek message_id directly."""
-    mid = str(message_id)
+    _validate_session_id(session_id)
+    if isinstance(message_id, bool) or not isinstance(message_id, (int, str)):
+        raise TtsResolveError(
+            "invalid_message_id",
+            "message_id must be an integer DeepSeek message id "
+            "(or a decimal string)",
+            param="message_id",
+        )
+    if isinstance(message_id, str):
+        if not message_id.isdigit():
+            raise TtsResolveError(
+                "invalid_message_id",
+                "message_id must be the integer DeepSeek message id of an "
+                "assistant reply of this session",
+                param="message_id",
+            )
+        mid = int(message_id)
+    else:
+        mid = message_id
     for f in _session_frames.get(session_id, []):
-        if str(f.get("response_msg_id")) == mid:
-            return session_id, int(mid)
+        if str(f.get("response_msg_id")) == str(mid):
+            return session_id, mid
     raise TtsResolveError(
         "message_not_voiceable",
         "message_id does not belong to this session's assistant messages",
@@ -935,63 +1078,234 @@ def _resolve_tts_raw(session_id: str, message_id: int | str) -> tuple[str, int]:
     )
 
 
-def _resolve_tts_by_messages(messages: list[dict], message_index: int | None) -> tuple[str, int]:
-    """Legacy resolution from a full messages array (clients without a
-    session id). message_index is 0-based into messages (negative from the
-    end); omitted → newest assistant message.
+def _resolve_tts_by_messages(messages: list[dict]) -> tuple[str, int]:
+    """Resolve (session_id, message_id) from a raw OpenAI messages list, like the
+    one the client sends to /v1/chat/completions — an alternative to a scheme
+    where a client (e.g. Hermes) that cannot recover chat_session_id describes
+    the conversation instead.
+
+    The list is keyed exactly like the completion flow (_hash_messages over the
+    user/system subset, _prefix_key), so the DeepSeek session created by this
+    proxy is found without the client knowing its id. The target reply:
+      - the one answering the list's latest prompt, when the list already
+        contains it (ends with an assistant or tool message);
+      - else the newest completed reply (the list ends with a fresh user prompt).
+    While a completion for this conversation is in flight its key is registered
+    in _tts_pending: the reply is either voiced directly (its DeepSeek id already
+    assigned) or reported as message_pending — never silently replaced by the
+    previous committed reply.
+    Works only for conversations that went through this running process.
     """
     if not isinstance(messages, list) or not messages:
         raise TtsResolveError(
-            "invalid_message_index",
-            "messages must be a non-empty array when resolved by history",
+            "invalid_messages",
+            "messages must be a non-empty array of OpenAI messages",
             param="messages",
         )
-    n = len(messages)
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant", "tool", "system"):
+            raise TtsResolveError(
+                "invalid_messages",
+                "messages must be OpenAI message objects with a role",
+                param="messages",
+            )
+    nkey = _hash_messages(_user_messages(messages))
+    pkey = _prefix_key(messages)
+    pending = _tts_pending.get(nkey)
+    if pending is None and pkey:
+        pending = _tts_pending.get(pkey)
+    if pending is not None:
+        session_id, mid = pending
+        if mid is not None:
+            return session_id, mid
+        raise TtsResolveError(
+            "message_pending",
+            "The reply to the latest prompt is still being generated — "
+            "retry in a moment",
+            param="messages",
+        )
+    entry = _session_store.get(nkey)
+    if entry is None and pkey:
+        entry = _session_store.get(pkey)
+    if entry is None:
+        raise TtsResolveError(
+            "message_not_voiceable",
+            "No session recorded for these messages — only replies generated "
+            "through this proxy (while it is running) can be voiced",
+            param="messages",
+        )
+    session_id = entry[0]
+    frame = _frame_for_key(session_id, nkey)
+    if frame is None and pkey:
+        frame = _frame_for_key(session_id, pkey)
+    mid = frame.get("response_msg_id") if frame else None
+    if mid is None:
+        raise TtsResolveError(
+            "message_not_voiceable",
+            "This assistant message cannot be voiced",
+            param="messages",
+        )
+    return session_id, mid
 
-    if message_index is not None:
-        idx = message_index
-        if not isinstance(idx, int) or isinstance(idx, bool):
-            raise TtsResolveError(
-                "invalid_message_index",
-                "message_index must be an integer",
-                param="message_index",
-            )
-        if idx < 0:
-            idx += n
-        if idx < 0 or idx >= n:
-            raise TtsResolveError(
-                "invalid_message_index",
-                f"message_index {message_index} out of range "
-                f"(messages has {n} entries)",
-                param="message_index",
-            )
-        if messages[idx].get("role") != "assistant":
-            raise TtsResolveError(
-                "not_assistant_message",
-                f"message at index {idx} has role '{messages[idx].get('role')}', "
-                f"expected 'assistant'",
-                param="message_index",
-            )
-        candidates = [idx]
-    else:
-        candidates = range(n - 1, -1, -1)
 
-    for i in candidates:
-        if messages[i].get("role") != "assistant":
+def _map_client_tail(session_id: str, messages: list[dict]) -> dict[int, int]:
+    """Map client assistant ordinals to recorded DeepSeek message ids.
+
+    Counts assistant messages in the CLIENT list — which survives a proxy
+    restart — and aligns them to recorded frames by turn key, newest first.
+    Only the contiguous post-restart tail can map: a client assistant message
+    is given the DeepSeek id of its turn's frame; walking stops at the first
+    reply that has no frame here (it predates this proxy process).
+
+    Returns {ordinal: message_id} for every mappable client assistant message.
+    """
+    frames = _session_frames.get(session_id, [])
+    by_key: dict[str, list[int]] = {}
+    for f in frames:
+        k = f.get("key")
+        if k:
+            by_key.setdefault(k, []).append(f["response_msg_id"])
+    # nkey of the conversation state at each assistant reply — exactly the key
+    # the completion flow records in _record_turn for that turn.
+    key_at: dict[int, str] = {}
+    user_system: list[dict] = []
+    for pos, m in enumerate(messages):
+        if m.get("role") in ("user", "system"):
+            user_system.append({"role": m["role"], "content": m.get("content", "")})
+        elif m.get("role") == "assistant":
+            key_at[pos] = _hash_messages(user_system)
+    mapped: dict[int, int] = {}
+    ordinal = sum(1 for m in messages if m.get("role") == "assistant") - 1
+    for pos in range(len(messages) - 1, -1, -1):
+        if messages[pos].get("role") != "assistant":
             continue
-        key = _hash_messages(_user_messages(messages[: i + 1]))
-        existing = _session_store.get(key)
-        if not existing:
-            continue
-        frame = _frame_for_key(existing[0], key)
-        if frame is not None and frame.get("response_msg_id") is not None:
-            return existing[0], frame["response_msg_id"]
+        ids = by_key.get(key_at.get(pos))
+        if not ids:
+            break  # earlier replies predate this proxy process
+        mapped[ordinal] = ids.pop()
+        ordinal -= 1
+    return mapped
 
+
+def _resolve_tts_by_messages_index(messages: list[dict], message_index) -> tuple[str, int]:
+    """message_index counted against the client's assistant messages.
+
+    The passed list is the client's whole conversation: it can include replies
+    recorded before this proxy process started (the DeepSeek session itself
+    survives via its server-side history even though the proxy restarted).
+    Replies are numbered by their position among the assistant messages IN THE
+    LIST; the recorded tail (aligned by turn key via _map_client_tail) supplies
+    the DeepSeek message ids. A reply outside that tail cannot be voiced — this
+    proxy process has never seen its DeepSeek id.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise TtsResolveError(
+            "invalid_messages",
+            "messages must be a non-empty array of OpenAI messages",
+            param="messages",
+        )
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant", "tool", "system"):
+            raise TtsResolveError(
+                "invalid_messages",
+                "messages must be OpenAI message objects with a role",
+                param="messages",
+            )
+    if not isinstance(message_index, int) or isinstance(message_index, bool):
+        raise TtsResolveError(
+            "invalid_message_index",
+            "message_index must be an integer — the 0-based assistant-message "
+            "number of this conversation (negative counts from the end)",
+            param="message_index",
+        )
+    nkey = _hash_messages(_user_messages(messages))
+    pkey = _prefix_key(messages)
+    assistant_total = sum(1 for m in messages if m.get("role") == "assistant")
+    idx = message_index
+    if idx < 0:
+        idx += assistant_total
+    if idx < 0 or idx >= assistant_total:
+        raise TtsResolveError(
+            "invalid_message_index",
+            f"message_index {message_index} is out of range: this conversation "
+            f"has {assistant_total} assistant message(s)",
+            param="message_index",
+        )
+    # The newest reply (the only one matching the full list) may still be
+    # generating — same retryable contract as _resolve_tts_by_messages.
+    pending = _tts_pending.get(nkey)
+    if pending is None and pkey:
+        pending = _tts_pending.get(pkey)
+    if pending is not None and idx == assistant_total - 1:
+        session_id, mid = pending
+        if mid is not None:
+            return session_id, mid
+        raise TtsResolveError(
+            "message_pending",
+            "The reply to the latest prompt is still being generated — "
+            "retry in a moment",
+            param="messages",
+        )
+    entry = _session_store.get(nkey)
+    if entry is None and pkey:
+        entry = _session_store.get(pkey)
+    if entry is None:
+        raise TtsResolveError(
+            "message_not_voiceable",
+            "No session recorded for these messages — only replies generated "
+            "through this proxy (while it is running) can be voiced",
+            param="messages",
+        )
+    session_id = entry[0]
+    mid = _map_client_tail(session_id, messages).get(idx)
+    if mid is None:
+        raise TtsResolveError(
+            "message_not_voiceable",
+            f"message_index {message_index} (assistant message {idx + 1}) predates "
+            "this proxy process — its DeepSeek message id was not recorded here. "
+            "Voicing works for replies generated since the proxy started.",
+            param="message_index",
+        )
+    return session_id, mid
+
+
+def _resolve_tts_target(body: dict) -> tuple[str, int]:
+    """Pick a resolution strategy from the request body:
+    messages → session+index → session+message_id → session alone (newest reply).
+
+    `messages` (OpenAI history, like /v1/chat/completions) is an alternative to
+    `chat_session_id`: the session is recovered from the message history, and an
+    optional message_index/message_id refines the target. With messages,
+    message_index numbers the ASSISTANT messages of the sent list (stable across
+    a proxy restart for the recorded tail); with chat_session_id it numbers the
+    proxy's recorded frames only.
+    """
+    raw_session = body.get("chat_session_id")
+    raw_msg = body.get("message_id")
+    message_index = body.get("message_index")
+    if message_index is None and "index" in body:
+        message_index = body["index"]
+    messages = body.get("messages")
+
+    if messages is not None:
+        if message_index is not None:
+            return _resolve_tts_by_messages_index(messages, message_index)
+        session_id, mid = _resolve_tts_by_messages(messages)
+        if raw_msg is not None:
+            return _resolve_tts_raw(session_id, raw_msg)
+        return session_id, mid
+    if raw_session and message_index is not None:
+        return _resolve_tts_by_session_index(raw_session, message_index)
+    if raw_session and raw_msg is not None:
+        return _resolve_tts_raw(raw_session, raw_msg)
+    if raw_session:
+        return _resolve_tts_by_session_index(raw_session, None)
     raise TtsResolveError(
-        "message_not_voiceable",
-        "No assistant message of this history was produced through the proxy "
-        "— system-prompt or synthetic messages cannot be voiced",
-        param="messages",
+        "invalid_chat_session_id",
+        "chat_session_id is required (message_index/message_id optional, without "
+        "them the latest assistant reply is voiced) — or pass messages to recover "
+        "the session from the conversation history",
+        param="chat_session_id",
     )
 
 
@@ -1817,6 +2131,14 @@ async def handle_completion(body: dict, req_id: str) -> dict:
 
         async def run_stream(on_chunk, on_done, on_error):
             session_cleaned = False
+            # Mark this conversation's key as in-flight so a messages-based TTS
+            # request cannot voice the previous committed reply while the answer
+            # to the latest prompt is still being generated.
+            stream_nkey = _hash_messages(_user_messages(messages))
+            stream_pkey = _prefix_key(messages)
+            _tts_pending[stream_nkey] = (session_id, None)
+            if stream_pkey:
+                _tts_pending[stream_pkey] = (session_id, None)
             try:
                 chunk_id = f"chatcmpl-{int(time.time() * 1000)}"
                 created = int(time.time())
@@ -2033,6 +2355,13 @@ async def handle_completion(body: dict, req_id: str) -> dict:
                         # <tool_result> первым сообщением (мусорная переписка).
                         rlog(req_id, f"Nothing emitted — keeping session {session_id} mapping for clean retry")
                 on_error(e)
+            finally:
+                # The in-flight answer is no longer pending: either it was
+                # committed (STORE above) or the generation ended/errored — a
+                # messages-based TTS can fall back to the committed frame again.
+                _tts_pending.pop(stream_nkey, None)
+                if stream_pkey:
+                    _tts_pending.pop(stream_pkey, None)
 
         return {"type": "stream", "run": run_stream,
                 "client": client, "session_id": session_id,
@@ -2050,18 +2379,30 @@ async def handle_completion(body: dict, req_id: str) -> dict:
         nonlocal full_thinking
         full_thinking += text
 
-    result = await client.complete(
-        session_id=session_id,
-        prompt=prompt,
-        model_type=model_type,
-        parent_message_id=parent_message_id,
-        thinking_enabled=thinking_enabled,
-        search_enabled=search_enabled,
-        ref_file_ids=ref_file_ids,
-        req_id=req_id,
-        on_text=on_text,
-        on_thinking=on_thinking,
-    )
+    # Same in-flight guard as the streaming branch: while this conversation's
+    # answer is being generated, messages-based TTS must not voice a stale reply.
+    ns_nkey = _hash_messages(_user_messages(messages))
+    ns_pkey = _prefix_key(messages)
+    _tts_pending[ns_nkey] = (session_id, None)
+    if ns_pkey:
+        _tts_pending[ns_pkey] = (session_id, None)
+    try:
+        result = await client.complete(
+            session_id=session_id,
+            prompt=prompt,
+            model_type=model_type,
+            parent_message_id=parent_message_id,
+            thinking_enabled=thinking_enabled,
+            search_enabled=search_enabled,
+            ref_file_ids=ref_file_ids,
+            req_id=req_id,
+            on_text=on_text,
+            on_thinking=on_thinking,
+        )
+    finally:
+        _tts_pending.pop(ns_nkey, None)
+        if ns_pkey:
+            _tts_pending.pop(ns_pkey, None)
 
     rlog(req_id, f"DEEPSEEK RESPONSE ({len(full_text)} chars):\n{full_text}")
 
@@ -2120,6 +2461,7 @@ async def handle_health(request: web.Request) -> web.Response:
     import os
     return web.json_response({
         "status": "ok",
+        "version": APP_VERSION,
         "auth_loaded": bool(auth["token"]),
         "port": request.app["port"],
         "deepseek_url": BASE_URL,
@@ -2134,6 +2476,16 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": "invalid_json"}, status=400)
 
     messages = body.get("messages", [])
+
+    if isinstance(messages, list) and messages:
+        try:
+            us = _user_messages(messages)
+            rlog(req_id,
+                 f"CHAT messages {len(messages)} total, {len(us)} user/system, "
+                 f"nkey={_hash_messages(us)} pkey={_prefix_key(messages)}, "
+                 f"tail_user={str(messages[-1].get('content', ''))[:40]!r}")
+        except Exception as exc:
+            rlog(req_id, f"CHAT: could not fingerprint request: {exc}")
 
     try:
         result = await handle_completion(body, req_id)
@@ -2225,7 +2577,39 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     return response
 
 
+def _route_handlers_for(app: web.Application, path: str) -> dict:
+    """Method -> handler for a path registered explicitly (catch-all excluded)."""
+    handlers = {}
+    for route in app.router.routes():
+        if route.method == "*":
+            continue
+        info = route.resource.get_info()
+        canonical = info.get("canonical") or info.get("path") or info.get("formatter")
+        if canonical == path:
+            handlers[route.method] = route.handler
+    return handlers
+
+
 async def handle_not_found(request: web.Request) -> web.Response:
+    path = request.path
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    handlers = _route_handlers_for(request.app, path)
+    if handlers:
+        method = request.method
+        if method in handlers:
+            rel = path + (("?" + request.query_string) if request.query_string else "")
+            return await handlers[method](request.clone(rel_url=rel))
+        allowed = sorted(handlers)
+        return web.json_response(
+            {
+                "error": "method_not_allowed",
+                "message": f"Method {method} not allowed for {path}",
+                "allowed": allowed,
+            },
+            status=405,
+            headers={"Allow": ", ".join(allowed)},
+        )
     return web.json_response(
         {"error": "not_found", "message": f"Path {request.path} not found"},
         status=404,
@@ -2305,11 +2689,29 @@ async def _tts_stream(
         nonlocal err
         try:
             client = create_client()
-            meta.update(await tts.download_tts(
-                client, session_id, message_id, voice=voice,
-                on_page=on_page, req_id=req_id,
-                debug=DEBUG or logging.getLogger().isEnabledFor(logging.DEBUG),
-            ))
+            async with _tts_download_lock:
+                # Downloads are sequential (one account voice); the voice is
+                # switched here, right before this synthesis, when it changed
+                # from the previous request. Before the first request the
+                # account voice is unknown, so the requested voice is always
+                # applied.
+                await _ensure_tts_voice(voice)
+                meta.update(await tts.download_tts(
+                    client, session_id, message_id, voice=voice,
+                    on_page=on_page, req_id=req_id,
+                    debug=DEBUG or logging.getLogger().isEnabledFor(logging.DEBUG),
+                ))
+                # The "ready" WS event reports the voice DeepSeek ACTUALLY used
+                # for this synthesis. POST /chat/tts/voice answers code 0 even
+                # when the switch does not stick, so trust the ready event and
+                # remember it: if it differs from the requested voice, the next
+                # request will detect the change and try to set the voice again.
+                actual = meta.get("voice_id")
+                if actual:
+                    if actual != voice:
+                        rlog(req_id, f"TTS voice MISMATCH: requested '{voice}', "
+                                     f"DeepSeek synthesized with '{actual}' — remembering actual")
+                    _remember_tts_voice(actual)
         except Exception as e:
             err = e
         finally:
@@ -2337,14 +2739,24 @@ async def _tts_stream(
                 await response.write(page)
 
         if err is not None:
+            if isinstance(err, tts.TtsSynthesisError):
+                rlog(req_id, f"TTS cannot voice: {err.error_code}: {err.message}")
+                tmp.unlink(missing_ok=True)
+                fut.set_result(False)
+                if not prepared:
+                    return web.json_response(
+                        {"error": err.error_code, "message": err.message, "param": None},
+                        status=400,
+                    )
+                return response
             rlog(req_id, f"TTS ERROR after {total} bytes: [{type(err).__name__}] {err}")
             tmp.unlink(missing_ok=True)
             if not prepared:
-                fut.set_exception(err)
+                fut.set_result(False)
                 return web.json_response(
                     {"error": "tts_failed", "message": str(err)}, status=502
                 )
-            fut.set_exception(err)
+            fut.set_result(False)
             await response.write_eof()
             return response
 
@@ -2367,7 +2779,7 @@ async def _tts_stream(
         except Exception:
             pass
         tmp.unlink(missing_ok=True)
-        fut.set_exception(e)
+        fut.set_result(False)
         if prepared:
             try:
                 await response.write_eof()
@@ -2379,15 +2791,24 @@ async def _tts_stream(
 async def handle_tts(request: web.Request) -> web.Response:
     """POST /v1/audio/tts — voice an existing assistant message.
 
-    Канонический контракт (сессия уже известна прокси, history не нужна):
+    Контракт:
         {"chat_session_id": "<id>", "message_index": 0|-1, "voice": "mira"}
     message_index — 0-based номер ассистентского ответа в сессии (только
     assistant-сообщения; регенерации индекс не меняют); минус — с конца.
+    Если message_index не указан — озвучивается последний ответ сессии.
 
     Альтернативы:
-        {"chat_session_id": "...", "message_id": <DeepSeek id>}   (advanced)
-        {"messages": [...], "message_index": 0|...}               (legacy)
+        {"chat_session_id": "...", "message_id": <DeepSeek id>}
+        {"messages": [OpenAI-история], "voice": "mira"} — сессия и ответ
+        восстанавливаются по истории (ответ на последний prompt, если он уже
+        в списке, иначе самый свежий); работает только для ответов,
+        сгенерированных через этот работающий прокси.
     Ответ — поток Ogg Opus, повторные запросы отдаются из кэша.
+
+    Ошибки: 400 — невалидный запрос, цель не доступна (message_not_voiceable,
+    invalid_message_index) или сообщение без текста (no_content — ответ
+    состоял только из think-блока); 503 — ответ ещё генерируется
+    (message_pending, стоит повторить); 502 — сбой синтеза на стороне DeepSeek.
     """
     req_id = _req_id()
     try:
@@ -2414,30 +2835,47 @@ async def handle_tts(request: web.Request) -> web.Response:
     message_index = body.get("message_index")
     if message_index is None and "index" in body:
         message_index = body["index"]
-    messages = body.get("messages")
+    if raw_session and raw_msg is None and message_index is None:
+        rlog(req_id, "TTS: no message_index — using newest assistant reply")
+
+    messages_body = body.get("messages")
+    if isinstance(messages_body, list) and messages_body:
+        try:
+            us = _user_messages(messages_body)
+            fp = ", ".join(
+                f"{m.get('role')}:{hashlib.sha256(json.dumps(m.get('content', ''), ensure_ascii=False).encode()).hexdigest()[:10]}"
+                for m in messages_body
+            )
+            rlog(req_id,
+                 f"TTS messages {len(messages_body)} total, {len(us)} user/system, "
+                 f"nkey={_hash_messages(us)} pkey={_prefix_key(messages_body)}, "
+                 f"index={message_index}, fp=[{fp}]")
+        except Exception as exc:
+            rlog(req_id, f"TTS: could not fingerprint messages body: {exc}")
 
     try:
-        if raw_session and message_index is not None:
-            target = _resolve_tts_by_session_index(raw_session, message_index)
-        elif raw_session and raw_msg is not None:
-            target = _resolve_tts_raw(raw_session, raw_msg)
-        elif raw_session:
-            rlog(req_id, "TTS: no message_index — using newest assistant reply")
-            target = _resolve_tts_by_session_index(raw_session, None)
-        elif messages:
-            target = _resolve_tts_by_messages(messages, message_index)
-        else:
-            raise TtsResolveError(
-                "invalid_message_index",
-                "Missing message reference: send chat_session_id + message_index "
-                "(or chat_session_id + message_id)",
-                param="message_index",
-            )
+        catalog = await get_tts_voices()
+        _validate_voice(voice, catalog["voices"])
     except TtsResolveError as e:
         rlog(req_id, f"TTS resolve error: {e.error_code}: {e.message}")
         return web.json_response(
             {"error": e.error_code, "message": e.message, "param": e.param},
             status=400,
+        )
+    except Exception as e:
+        rlog(req_id, f"TTS: voice catalogue unavailable ({e}) — skipping validation")
+
+    try:
+        target = _resolve_tts_target(body)
+    except TtsResolveError as e:
+        rlog(req_id, f"TTS resolve error: {e.error_code}: {e.message}")
+        # message_pending (503) is transient: the reply to the latest prompt is
+        # still being generated, so the client should retry — unlike contract
+        # errors (400) which mean the request itself is wrong.
+        status = 503 if e.error_code == "message_pending" else 400
+        return web.json_response(
+            {"error": e.error_code, "message": e.message, "param": e.param},
+            status=status,
         )
     session_id, message_id = target
 
@@ -2492,7 +2930,7 @@ OPENAPI_SPEC: dict = {
     "openapi": "3.0.3",
     "info": {
         "title": "DeepSeek Free -> OpenAI-compatible Proxy",
-        "version": "2.0.0",
+        "version": APP_VERSION,
         "description": (
             "Прокси над бесплатной веб-сессией DeepSeek. OpenAI-совместимые "
             "completions плюс нестандартный TTS-эндпоинт для озвучивания "
@@ -2501,6 +2939,7 @@ OPENAPI_SPEC: dict = {
             "нельзя озвучить)."
         ),
     },
+    "servers": [{"url": "/", "description": "Тот же origin, где запущен прокси"}],
     "paths": {
         "/v1/chat/completions": {
             "post": {
@@ -2542,74 +2981,189 @@ OPENAPI_SPEC: dict = {
                     },
                     "400": {"$ref": "#/components/responses/TtsError"},
                     "405": {"description": "Только POST"},
-                    "502": {"description": "Ошибка синтеза на стороне DeepSeek"},
+                    "503": {"description": (
+                        "The reply to the latest prompt is still being generated "
+                        "(error: message_pending) — transient; the client should "
+                        "retry the same request."
+                    )},
+                    "502": {"description": (
+                        "Ошибка синтеза на стороне DeepSeek "
+                        "(error: tts_failed). Частая причина: "
+                        "voice_unsupported_language — текст ответа на языке, "
+                        "которого нет в languages выбранного голоса; клиенту "
+                        "стоит выбрать голос из пересечения languages голоса и "
+                        "языка текста."
+                    )},
+                },
+            }
+        },
+        "/v1/audio/voices": {
+            "get": {
+                "summary": "Список поддерживаемых TTS-голосов.",
+                "description": (
+                    "Каталог голосов DeepSeek, загружается один раз на "
+                    "сессию и кэшируется. voice в /v1/audio/tts должен "
+                    "принадлежать этому списку."
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Список голосов",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/VoicesList"}
+                            }
+                        },
+                    },
+                    "401": {"description": "Требуется авторизация DeepSeek"},
+                    "502": {"description": "Каталог не удалось получить с DeepSeek"},
                 },
             }
         },
         "/v1/models": {
-            "get": {"summary": "Список доступных моделей."},
+            "get": {
+                "summary": "Список доступных моделей.",
+                "responses": {
+                    "200": {
+                        "description": "OpenAI-совместимый список моделей",
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    }
+                },
+            },
         },
         "/health": {
-            "get": {"summary": "Статус сервера."},
+            "get": {
+                "summary": "Статус сервера.",
+                "responses": {
+                    "200": {
+                        "description": "status + version + состояние авторизации",
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    }
+                },
+            },
         },
         "/openapi.json": {
-            "get": {"summary": "Эта схема."},
+            "get": {
+                "summary": "Эта схема.",
+                "responses": {
+                    "200": {
+                        "description": "Эта OpenAPI-схема",
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    }
+                },
+            },
         },
     },
     "components": {
         "schemas": {
             "TtsRequest": {
                 "type": "object",
+                "required": [],
                 "description": (
-                    "Способы указать сообщение:\n"
-                    "1) chat_session_id + message_index — канонический;\n"
-                    "2) chat_session_id + message_id (виден в отладке) — advanced;\n"
-                    "3) messages (+ message_index) — legacy, для клиентов без session id.\n"
-                    "message_index: 0-based номер ассистентского ответа в сессии "
-                    "(только assistant-сообщения; регенерации индекс не меняют); "
-                    "отрицательные значения считаются с конца. Озвучивать можно "
-                    "только ответы, сгенерированные DeepSeek через этот прокси."
+                    "Озвучивание ассистентского ответа сессии DeepSeek.\n"
+                    "Требуется chat_session_id или messages: id сессии из "
+                    "completion-ответа, либо полная OpenAI-история messages — "
+                    "тогда сессия и нужный ответ восстанавливаются по истории "
+                    "(только ответы, сгенерированные через этот работающий "
+                    "прокси).\n"
+                    "message_index необязателен: без него озвучивается "
+                    "последний ответ сессии; 0-based номер — конкретный ответ "
+                    "(только assistant-сообщения; регенерации индекс не "
+                    "меняют); отрицательные значения считаются с конца.\n"
+                    "Вместо message_index можно передать message_id (виден в "
+                    "отладке). Озвучивать можно только ответы, "
+                    "сгенерированные DeepSeek через этот прокси."
                 ),
-                "oneOf": [
-                    {"required": ["chat_session_id", "message_index"]},
-                    {"required": ["chat_session_id", "message_id"]},
-                    {"required": ["messages"]},
-                ],
                 "properties": {
                     "chat_session_id": {
                         "type": "string",
-                        "description": "DeepSeek session id из completion-ответа.",
+                        "description": "DeepSeek session id из completion-ответа "
+                        "(нужен, если не передан messages).",
+                    },
+                    "messages": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "OpenAI-сообщения как в "
+                        "/v1/chat/completions — альтернатива chat_session_id. "
+                        "Сессия и ассистентский ответ восстанавливаются по "
+                        "истории: озвучивается ответ на последний prompt "
+                        "списка, если он уже в истории (список заканчивается "
+                        "assistant/tool), иначе самый свежий ответ сессии. "
+                        "message_index при messages нумерует assistant-"
+                        "сообщения СПИСКА (0-based) — это работает и после "
+                        "перезапуска прокси: прокси записывает ответы с "
+                        "момента запуска и выравнивает хвост истории по ключам "
+                        "поворотов; более ранние ответы недоступны "
+                        "(message_not_voiceable). message_id уточняет цель "
+                        "внутри найденной сессии. Если на ключ этой истории "
+                        "идёт живая генерация — 503 message_pending (временная "
+                        "ошибка, клиенту стоит повторить запрос).",
                     },
                     "message_index": {
                         "type": "integer",
                         "default": -1,
-                        "description": "0-based номер ассистентского ответа; -1 = самый свежий.",
+                        "description": "0-based номер ассистентского ответа; "
+                        "без него — последний ответ (-1 = самый свежий). При "
+                        "chat_session_id — номер среди записанных прокси "
+                        "ответов сессии; при messages — номер среди "
+                        "assistant-сообщений переданного списка.",
                     },
                     "message_id": {
                         "type": "integer",
-                        "description": "(advanced) Идентификатор ответа внутри DeepSeek.",
+                        "description": "(advanced) Идентификатор ответа внутри "
+                        "DeepSeek; десятичная строка цифр тоже принимается, "
+                        "прочее — ошибка invalid_message_id.",
                     },
-                    "messages": {
-                        "type": "array",
-                        "items": {"$ref": "#/components/schemas/ChatMessage"},
-                        "description": "(legacy) Полная история диалога как в /v1/chat/completions.",
+                    "voice": {
+                        "type": "string",
+                        "default": "mira",
+                        "description": "Голос синтеза. Должен входить в каталог "
+                        "GET /v1/audio/voices (загружается один раз на сессию); "
+                        "неизвестный голос — ошибка invalid_voice. Также должен "
+                        "поддерживать язык озвучиваемого текста — см. languages "
+                        "голоса в каталоге (иначе 502 "
+                        "voice_unsupported_language). Голос применяется к "
+                        "аккаунту DeepSeek перед первой озвучкой и "
+                        "запоминается в процессе.",
                     },
-                    "voice": {"type": "string", "default": "mira", "enum": ["mira"]},
                 },
             },
-            "ChatMessage": {
+            "Voice": {
                 "type": "object",
                 "properties": {
-                    "role": {
+                    "voice_id": {"type": "string"},
+                    "name": {"type": "string", "description": "Английское имя"},
+                    "gender": {"type": "string", "enum": ["male", "female"]},
+                    "languages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Коды языков (ISO 639-1, плюс yue) этого "
+                        "голоса. Голос озвучивает только текст на этих языках: "
+                        "несовместимый язык даёт 502 с message "
+                        "voice_unsupported_language.",
+                    },
+                    "is_default": {"type": "boolean"},
+                    "description": {"type": "string"},
+                },
+            },
+            "VoicesList": {
+                "type": "object",
+                "description": (
+                    "Каталог голосов DeepSeek. default_voice_id — голос по "
+                    "умолчанию DeepSeek; current_voice_id — голос, выбранный "
+                    "в аккаунте DeepSeek (состояние аккаунта), на запросы с "
+                    "явным voice не влияет — синтез использует переданный voice."
+                ),
+                "properties": {
+                    "object": {"type": "string"},
+                    "default_voice_id": {"type": "string", "nullable": True},
+                    "current_voice_id": {
                         "type": "string",
-                        "enum": ["system", "user", "assistant", "tool"],
+                        "nullable": True,
+                        "description": "Голос, выбранный в аккаунте DeepSeek. "
+                        "На запросы /v1/audio/tts с явным voice не влияет, но "
+                        "показывает, каким голосом синтез шёл бы без voice.",
                     },
-                    "content": {
-                        "oneOf": [
-                            {"type": "string"},
-                            {"type": "array", "items": {"type": "object"}},
-                        ]
-                    },
+                    "data": {"type": "array", "items": {"$ref": "#/components/schemas/Voice"}},
                 },
             },
             "Error": {
@@ -2625,8 +3179,17 @@ OPENAPI_SPEC: dict = {
             "TtsError": {
                 "description": (
                     "Контрактная ошибка. error ∈ "
-                    "{invalid_message_index, not_assistant_message, "
-                    "message_not_voiceable}"
+                    "{invalid_chat_session_id, invalid_message_index, "
+                    "invalid_message_id, invalid_voice, "
+                    "message_not_voiceable, message_pending, no_content}. "
+                    "message_pending приходит со статусом 503 и значит, что "
+                    "ответ на последний prompt ещё генерируется — запрос "
+                    "корректен, его надо повторить. no_content — цель найдена, "
+                    "но в ответе нет текста для озвучки (только think-блок). "
+                    "Ошибка синтеза приходит со "
+                    "статусом 502 как error=tts_failed; message="
+                    "voice_unsupported_language означает, что текст ответа на "
+                    "языке, которого нет в languages выбранного голоса."
                 ),
                 "content": {
                     "application/json": {
@@ -2643,6 +3206,30 @@ async def handle_openapi(request: web.Request) -> web.Response:
     return web.json_response(OPENAPI_SPEC)
 
 
+async def handle_voices(request: web.Request) -> web.Response:
+    """GET /v1/audio/voices — TTS voice catalogue (cached per session)."""
+    req_id = _req_id()
+    try:
+        catalog = await get_tts_voices()
+    except AuthError as e:
+        return web.json_response(
+            {"error": "auth_required", "message": str(e)}, status=401
+        )
+    except Exception as e:
+        rlog(req_id, f"TTS voices failed: {e}")
+        return web.json_response(
+            {"error": "upstream_error", "message": str(e)}, status=502
+        )
+    return web.json_response(
+        {
+            "object": "list",
+            "default_voice_id": catalog.get("default_voice_id"),
+            "current_voice_id": catalog.get("current_voice_id"),
+            "data": _voice_entries(catalog["voices"]),
+        }
+    )
+
+
 # ─── CORS middleware ───────────────────────────────────────
 
 @web.middleware
@@ -2655,15 +3242,21 @@ async def cors_middleware(request, handler):
         except web.HTTPException as ex:
             resp = ex
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     resp.headers["Access-Control-Expose-Headers"] = "X-Chat-Session-Id"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    path = request.path
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    allowed = [m for m in _route_handlers_for(request.app, path)]
+    if allowed:
+        resp.headers["Access-Control-Allow-Methods"] = ", ".join(allowed + ["OPTIONS"])
+    else:
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp
 
 
-# ─── Main ─────────────────────────────────────────────────
-
-async def run_server(port: int, host: str):
+def build_app(port: int) -> web.Application:
     app = web.Application(middlewares=[cors_middleware], client_max_size=0)
     app["port"] = port
 
@@ -2673,7 +3266,15 @@ async def run_server(port: int, host: str):
     app.router.add_route("GET", "/openapi.json", handle_openapi)
     app.router.add_route("POST", "/v1/chat/completions", handle_chat)
     app.router.add_route("POST", "/v1/audio/tts", handle_tts)
+    app.router.add_route("GET", "/v1/audio/voices", handle_voices)
     app.router.add_route("*", "/{path:.*}", handle_not_found)
+    return app
+
+
+# ─── Main ─────────────────────────────────────────────────
+
+async def run_server(port: int, host: str):
+    app = build_app(port)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -2699,6 +3300,7 @@ async def run_server(port: int, host: str):
 ║══════════════════════════════════════════════════║
 ║  POST http://localhost:{port}/v1/chat/completions ║
 ║  POST http://localhost:{port}/v1/audio/tts        ║
+║  GET  http://localhost:{port}/v1/audio/voices     ║
 ║  GET  http://localhost:{port}/v1/models           ║
 ║  GET  http://localhost:{port}/openapi.json        ║
 ║  GET  http://localhost:{port}/health              ║
@@ -2716,6 +3318,7 @@ async def run_server(port: int, host: str):
 +--------------------------------------------------+
 |  POST http://localhost:{port}/v1/chat/completions |
 |  POST http://localhost:{port}/v1/audio/tts        |
+|  GET  http://localhost:{port}/v1/audio/voices     |
 |  GET  http://localhost:{port}/v1/models           |
 |  GET  http://localhost:{port}/openapi.json        |
 |  GET  http://localhost:{port}/health              |

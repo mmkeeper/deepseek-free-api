@@ -7,6 +7,10 @@ DeepSeek's web UI voices only real chat messages. The flow is:
       &ticket=...&mode=manual&format=opus
       -> JSON events (ready / ack / finish) + binary Opus audio frames
 
+The handshake carries no voice: DeepSeek synthesizes with the account's
+current voice (POST /api/v0/chat/tts/voice changes it, see
+GET /api/v0/chat/tts/voices -> current_voice_id).
+
 This module downloads the stream, packaging raw Opus packets into a valid
 Ogg Opus file (RFC 7845): a passthrough is used when the server already
 delivers whole Ogg pages, otherwise raw packets are muxed locally using the
@@ -34,6 +38,20 @@ from .client import DeepSeekClient
 from .config import BASE_URL, TTS_CACHE_DIR, TTS_PATH, get_socks5_proxy
 
 log = logging.getLogger("ds")
+
+
+class TtsSynthesisError(Exception):
+    """The requested DeepSeek message cannot be synthesized.
+
+    This is a domain-level (400) condition — e.g. the message finished with no
+    voiceable text — not an upstream or transport failure (those stay generic
+    RuntimeError → 502).
+    """
+
+    def __init__(self, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.message = message
 
 _OGG_SERIAL = 0x64656570  # "deep"
 _OGG_CRC_POLY = 0x04C11DB7
@@ -192,6 +210,23 @@ def tts_cache_dir() -> Path:
     return TTS_CACHE_DIR
 
 
+def tts_ws_url(chat_session_id: str, message_id: int, ticket: str) -> str:
+    """Build the DeepSeek TTS WebSocket handshake URL.
+
+    The voice is not part of the handshake: DeepSeek synthesizes with the
+    account's current voice (see GET /api/v0/chat/tts/voices -> current_voice_id).
+    """
+    params = {
+        "chat_session_id": chat_session_id,
+        "message_id": str(message_id),
+        "ticket": ticket,
+        "mode": "manual",
+        "format": "opus",
+    }
+    ws_base = "wss://" + BASE_URL.split("://", 1)[1]
+    return f"{ws_base}{TTS_PATH}" + "?" + urlencode(params)
+
+
 async def download_tts(
     client: DeepSeekClient,
     chat_session_id: str,
@@ -208,17 +243,13 @@ async def download_tts(
     client response): whole Ogg pages in passthrough mode, muxed pages in raw
     mode. Raises RuntimeError on DeepSeek-side failure (e.g. the message is
     not voiceable).
+
+    The voice is resolved on the DeepSeek account (current_voice_id), not sent
+    in the handshake; the voice argument only keys the local cache and is kept
+    for parity with the client-facing parameter.
     """
     ticket = await client.get_tts_ticket(req_id=req_id)
-    params = {
-        "chat_session_id": chat_session_id,
-        "message_id": str(message_id),
-        "ticket": ticket,
-        "mode": "manual",
-        "format": "opus",
-    }
-    ws_base = "wss://" + BASE_URL.split("://", 1)[1]
-    url = f"{ws_base}{TTS_PATH}" + "?" + urlencode(params)
+    url = tts_ws_url(chat_session_id, message_id, ticket)
 
     headers = client._build_headers()
     headers["x-client-bundle-id"] = "com.deepseek.chat"
@@ -291,14 +322,26 @@ async def download_tts(
                         meta["audio_id"] = payload.get("audio_id")
                         meta["voice_id"] = payload.get("voice_id")
                         meta["trace_id"] = payload.get("trace_id")
+                        if debug or log.isEnabledFor(logging.DEBUG):
+                            log.debug(
+                                f"[REQ-{req_id}] TTS ready: "
+                                f"voice_id={payload.get('voice_id')!r} "
+                                f"(requested {voice!r}) "
+                                f"audio_id={payload.get('audio_id')!r}"
+                            )
                         if on_ready:
                             on_ready(payload)
                     elif ev == "finish":
                         if payload.get("code", 0) != 0:
-                            raise RuntimeError(
-                                f"DeepSeek TTS error: "
-                                f"{payload.get('msg') or payload.get('error') or payload}"
-                            )
+                            raw = payload.get("msg") or payload.get("error") or payload
+                            text = str(raw)
+                            if "no_content" in text:
+                                raise TtsSynthesisError(
+                                    "no_content",
+                                    "Это сообщение не содержит текста для озвучки "
+                                    "(ответ состоял только из размышлений — think-блока)",
+                                )
+                            raise RuntimeError(f"DeepSeek TTS error: {text}")
                         break
                 elif msg.type in (
                     aiohttp.WSMsgType.CLOSE,
