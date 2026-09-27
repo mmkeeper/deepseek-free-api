@@ -738,6 +738,9 @@ def _tool_region_end(masked: str, start: int) -> int:
 
 PREFIX = "dsf-"
 
+# Максимальный размер контекста моделей в токенах, объявляется в /v1/models
+CONTEXT_LENGTH = 1000000
+
 _tool_call_counter = 0
 
 def _next_tool_call_id(tool_name: str) -> str:
@@ -2448,11 +2451,11 @@ async def handle_options(request: web.Request) -> web.Response:
 async def handle_models(request: web.Request) -> web.Response:
     now = int(time.time() * 1000)
     models = [
-        {"id": f"{PREFIX}deepseek-flash", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": f"{PREFIX}deepseek-flash", "object": "model", "created": now, "owned_by": "deepseek", "context_length": CONTEXT_LENGTH},
         # Обратная совместимость: старые имена перенаправляются на ту же модель
-        {"id": f"{PREFIX}deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek"},
-        {"id": f"{PREFIX}deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek"},
-        {"id": f"{PREFIX}deepseek-vision", "object": "model", "created": now, "owned_by": "deepseek"},
+        {"id": f"{PREFIX}deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek", "context_length": CONTEXT_LENGTH},
+        {"id": f"{PREFIX}deepseek-reasoner", "object": "model", "created": now, "owned_by": "deepseek", "context_length": CONTEXT_LENGTH},
+        {"id": f"{PREFIX}deepseek-vision", "object": "model", "created": now, "owned_by": "deepseek", "context_length": CONTEXT_LENGTH},
     ]
     return web.json_response({"object": "list", "data": models})
 
